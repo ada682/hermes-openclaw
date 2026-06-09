@@ -13,10 +13,12 @@
  *  • Connect Protocol binary framing (encode + incremental decode)
  *
  * Env vars:
- *   KIMI_TOKEN_1..10   – Kimi tokens (refresh: cpmt_xxx  atau JWT: eyJ...)
- *   KIMI_PROXY_PORT    – port (default: 4892)
- *   KIMI_MODEL         – default model (default: kimi-k2.6)
- *   KIMI_SHOW_THINKING – emit reasoning_content delta (default: false)
+ *   KIMI_TOKEN_1..10         – Kimi tokens (refresh: cpmt_xxx  atau JWT: eyJ...)
+ *   KIMI_PROXY_PORT          – port (default: 4892)
+ *   KIMI_MODEL               – default model (default: kimi-k2.6)
+ *   KIMI_SHOW_THINKING       – emit reasoning_content delta (default: false)
+ *   KIMI_STREAM_IDLE_TIMEOUT – ms tanpa data sebelum stream dikill (default: 90000 = 90s)
+ *   KIMI_STREAM_TOTAL_TIMEOUT– ms hard cap per stream (default: 300000 = 5min)
  */
 
 import http   from "http";
@@ -40,6 +42,8 @@ const REFRESH_BUFFER   = 300_000; // refresh 5 menit sebelum expire (ms)
 const OVERLOADED_RETRY_MAX   = parseInt(process.env.KIMI_OVERLOADED_RETRY  || "3",    10); // max retry attempts
 const OVERLOADED_RETRY_DELAY = parseInt(process.env.KIMI_OVERLOADED_DELAY  || "3000", 10); // base delay ms (x attempt#)
 const IMAGE_CACHE_TTL_MS     = parseInt(process.env.KIMI_IMAGE_CACHE_TTL   || String(10 * 60 * 1000), 10); // default: 10 min
+const STREAM_IDLE_TIMEOUT_MS  = parseInt(process.env.KIMI_STREAM_IDLE_TIMEOUT  || "90000",  10); // 90s tanpa data → hang
+const STREAM_TOTAL_TIMEOUT_MS = parseInt(process.env.KIMI_STREAM_TOTAL_TIMEOUT || "300000", 10); // 5min hard cap
 
 // ── Image file-ID cache ──────────────────────────────────────────────────────
 //
@@ -319,6 +323,14 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
  */
 class OverloadedError extends Error {
   constructor(msg) { super(msg); this.name = "OverloadedError"; this.isOverloaded = true; }
+}
+
+/**
+ * Thrown when Kimi stream hangs (idle timeout atau total timeout).
+ * Di-retry dengan slot berbeda — slot saat ini kemungkinan sedang "stuck".
+ */
+class StreamTimeoutError extends Error {
+  constructor(msg) { super(msg); this.name = "StreamTimeoutError"; this.isTimeout = true; }
 }
 
 /**
@@ -813,8 +825,45 @@ function streamKimi(slot, blocks, scenario, thinking, useSearch, res, id, modelI
       let reasoningSent = false;
       let resolved      = false;
 
+      // ── Stream timeouts ─────────────────────────────────────────────────────
+      // Kimi kadang biarkan koneksi TCP tetap hidup tanpa kirim data / event.done.
+      // Tanpa timer ini proxy nunggu selamanya (jam-jaman).
+      // - IDLE timeout  : reset setiap kali ada chunk data masuk
+      // - TOTAL timeout : hard cap untuk satu stream, apapun yang terjadi
+      let _idleTimer  = null;
+      let _totalTimer = null;
+
+      function _clearTimers() {
+        if (_idleTimer)  { clearTimeout(_idleTimer);  _idleTimer  = null; }
+        if (_totalTimer) { clearTimeout(_totalTimer); _totalTimer = null; }
+      }
+
+      function _kickIdle() {
+        if (_idleTimer) clearTimeout(_idleTimer);
+        _idleTimer = setTimeout(() => {
+          if (resolved) return;
+          _clearTimers();
+          resolved = true;
+          console.error(`[KimiProxy] ✗ stream idle timeout — tidak ada data selama ${STREAM_IDLE_TIMEOUT_MS/1000}s`);
+          try { kimiRes.destroy(); } catch {}
+          reject(new StreamTimeoutError(`Kimi stream idle timeout (${STREAM_IDLE_TIMEOUT_MS/1000}s)`));
+        }, STREAM_IDLE_TIMEOUT_MS);
+      }
+
+      _totalTimer = setTimeout(() => {
+        if (resolved) return;
+        _clearTimers();
+        resolved = true;
+        console.error(`[KimiProxy] ✗ stream total timeout — melebihi ${STREAM_TOTAL_TIMEOUT_MS/1000}s`);
+        try { kimiRes.destroy(); } catch {}
+        reject(new StreamTimeoutError(`Kimi stream total timeout (${STREAM_TOTAL_TIMEOUT_MS/1000}s)`));
+      }, STREAM_TOTAL_TIMEOUT_MS);
+
+      _kickIdle(); // mulai hitungan idle dari saat response headers diterima
+
       function done() {
         if (resolved) return;
+        _clearTimers();
         resolved = true;
 
         if (activeTools && hasToolUse(answerBuf)) {
@@ -849,6 +898,7 @@ function streamKimi(slot, blocks, scenario, thinking, useSearch, res, id, modelI
           console.error(`[KimiProxy] server error: ${reason || "unknown"} | ${msg}`);
           if (!resolved) {
             resolved = true;
+            _clearTimers();
             if (reason === "REASON_COMPLETION_OVERLOADED") {
               reject(new OverloadedError(msg));
             } else {
@@ -928,6 +978,7 @@ function streamKimi(slot, blocks, scenario, thinking, useSearch, res, id, modelI
                                     answerBuf.includes("</tool_use>");
               if (blockComplete) {
                 resolved = true;
+                _clearTimers();
                 emitToolCalls(res, id, modelId, answerBuf);
                 res.write("data: [DONE]\n\n");
                 resolve();
@@ -939,12 +990,13 @@ function streamKimi(slot, blocks, scenario, thinking, useSearch, res, id, modelI
       });
 
       kimiRes.on("data", chunk => {
+        _kickIdle(); // reset idle timer setiap ada data masuk
         try { parseChunk(chunk); } catch (e) {
           console.error("[KimiProxy] frame parse error:", e.message);
         }
       });
-      kimiRes.on("end",   () => { if (!resolved) done(); });
-      kimiRes.on("error", e  => { if (!resolved) { resolved = true; reject(e); } });
+      kimiRes.on("end",   () => { _clearTimers(); if (!resolved) done(); });
+      kimiRes.on("error", e  => { _clearTimers(); if (!resolved) { resolved = true; reject(e); } });
     });
 
     req.on("error", reject);
@@ -976,23 +1028,30 @@ async function streamKimiWithRetry(firstSlot, blocks, scenario, thinking, useSea
   for (let attempt = 0; attempt <= OVERLOADED_RETRY_MAX; attempt++) {
     try {
       await streamKimi(curSlot, blocks, scenario, thinking, useSearch, res, id, modelId, activeTools);
-      if (attempt > 0) console.log(`[KimiProxy] ✓ Overloaded retry succeeded on attempt ${attempt + 1}`);
+      if (attempt > 0) console.log(`[KimiProxy] ✓ retry berhasil di attempt ${attempt + 1}`);
       return; // ✓ success
     } catch (e) {
-      if (e.isOverloaded && attempt < OVERLOADED_RETRY_MAX) {
-        const delay = OVERLOADED_RETRY_DELAY * (attempt + 1);
-        console.warn(`[KimiProxy] ⚠ Overloaded (attempt ${attempt + 1}/${OVERLOADED_RETRY_MAX + 1}) — retry in ${delay}ms...`);
-        // Keep SSE connection alive with a comment (ignored by OpenAI clients)
-        if (isStreaming) {
-          try { res.write(`: kimi overloaded, retrying (${attempt + 1}/${OVERLOADED_RETRY_MAX})...\n\n`); } catch {}
-        }
-        await sleep(delay);
-        curSlot = nextSlot(); // try a different token slot on each retry
-      } else {
-        // Different error, or exhausted retries → bubble up
+      const retryable = (e.isOverloaded || e.isTimeout) && attempt < OVERLOADED_RETRY_MAX;
+      if (retryable) {
         if (e.isOverloaded) {
-          console.error(`[KimiProxy] ✗ Overloaded after ${OVERLOADED_RETRY_MAX + 1} attempts — giving up.`);
+          const delay = OVERLOADED_RETRY_DELAY * (attempt + 1);
+          console.warn(`[KimiProxy] ⚠ Overloaded (attempt ${attempt + 1}/${OVERLOADED_RETRY_MAX + 1}) — retry in ${delay}ms...`);
+          if (isStreaming) {
+            try { res.write(`: kimi overloaded, retrying (${attempt + 1}/${OVERLOADED_RETRY_MAX})...\n\n`); } catch {}
+          }
+          await sleep(delay);
+        } else {
+          // isTimeout — langsung retry tanpa delay, slot stuck bukan soal load
+          console.warn(`[KimiProxy] ⚠ Stream timeout (attempt ${attempt + 1}/${OVERLOADED_RETRY_MAX + 1}) — ganti slot segera...`);
+          if (isStreaming) {
+            try { res.write(`: kimi stream timeout, retrying slot lain...\n\n`); } catch {}
+          }
         }
+        curSlot = nextSlot();
+      } else {
+        // Error lain atau retry habis → bubble up ke HTTP handler
+        if (e.isOverloaded) console.error(`[KimiProxy] ✗ Overloaded after ${OVERLOADED_RETRY_MAX + 1} attempts — giving up.`);
+        if (e.isTimeout)    console.error(`[KimiProxy] ✗ Stream timeout after ${OVERLOADED_RETRY_MAX + 1} attempts — giving up.`);
         throw e;
       }
     }
