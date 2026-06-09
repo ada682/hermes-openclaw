@@ -283,3 +283,4 @@ setelah reset, jalankan `node start.js` lagi dari awal.
 **port sudah dipakai**  
 → kimi: set `KIMI_PROXY_PORT=4893` sebelum jalanin  
 → qwen: defaultnya 4891, edit langsung di `reverse-proxy.js`
+1
