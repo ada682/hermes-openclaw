@@ -1,4 +1,5 @@
 # sonnetrade — reverse proxy + hermes gateway
+it seems that OpenClaw may need a few adjustments, since Kimi hasn't been tested on OpenClaw yet hehe
 
 bikin dlu file .env.qwen dan .env.kimi buat diisi nanti setelah lu paham ,walau padahal lu gaakan paham
 
