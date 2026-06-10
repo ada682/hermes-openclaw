@@ -61,11 +61,27 @@ how to get: open qwen chat → F12 → Application → Local Storage → click q
 node start.js
 
 # 2 terminals (recommended)
-node start.js proxy kimi    # terminal 1
+node start.js proxy   # terminal 1
 # or
-node start.js proxy qwen
 node start.js gateway       # terminal 2
 ```
+Note: First, choose whether you want to use Qwen or Kimi.
+
+To do that, run:
+node start.js proxy qwen
+
+or
+
+node start.js proxy kimi
+
+Also, choose whether you want to use OpenClaw or Hermes Agent as the gateway.
+
+To do that, run:
+node start.js gateway openclaw
+
+or
+
+node start.js gateway hermes
 
 proxy choice is saved automatically, so you only need to run `node start.js proxy kimi` once.
 
