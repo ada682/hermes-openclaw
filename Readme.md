@@ -1,5 +1,5 @@
 # sonnetrade - telegram = @Realsonnet
-bot telegram yang pakai qwen / kimi sebagai backend, tanpa bayar API resmi. unlimited token
+agents yang pake qwen / kimi,reverse api tanpa bayar API resmi. unlimited token
 
 > 🇬🇧 [Read in English](README.en.md)
 
