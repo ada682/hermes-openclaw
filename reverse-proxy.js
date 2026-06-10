@@ -337,6 +337,64 @@ function buildImageFileEntry(info) {
   };
 }
 
+// ═════════════════════════════════════════════════════════════════════════
+// ── Document Upload (PDF, Word, dll) ──────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════
+//
+// STS flow identik dengan image upload — getSTS sudah otomatis pakai
+// filetype:"file" untuk non-image MIME.  Yang berbeda hanya format entry
+// files[] yang dikirim ke Qwen (lebih lengkap, ada nested `file` object).
+//
+// Accepted input formats dari client:
+//   1. Anthropic-style document part:
+//      { type: "document", source: { type: "base64", media_type: "application/pdf", data: "..." } }
+//   2. OpenAI-style file part (custom):
+//      { type: "file", file: { filename: "doc.pdf", file_data: "data:application/pdf;base64,..." } }
+
+// Format document info → entry files[] yang dikenali Qwen
+function buildDocumentFileEntry(info) {
+  const now    = Date.now();
+  const fileId = info.file_id || uuid();
+  return {
+    type:            "file",
+    name:            info.filename || "document.pdf",
+    url:             info.file_url || "",
+    size:            info.filesize || 0,
+    id:              fileId,
+    fileId:          fileId,
+    itemId:          uuid(),
+    uploadTaskId:    uuid(),
+    fileClass:       "document",
+    file_type:       info.mimetype || "application/pdf",
+    showType:        "file",
+    status:          "uploaded",
+    greenNet:        "success",
+    collection_name: "",
+    error:           "",
+    progress:        0,
+    // Nested file object — dipakai Qwen untuk parsing & referensi
+    file: {
+      id:                 fileId,
+      filename:           info.filename || "document.pdf",
+      name:               info.filename || "document.pdf",
+      size:               info.filesize || 0,
+      type:               info.mimetype || "application/pdf",
+      hash:               null,
+      webkitRelativePath: "",
+      data:               {},
+      created_at:         now,
+      update_at:          now,
+      lastModified:       now,
+      meta: {
+        name:         info.filename || "document.pdf",
+        size:         info.filesize || 0,
+        content_type: info.mimetype || "application/pdf",
+        parse_meta:   { parse_status: "success" },
+      },
+    },
+  };
+}
+
 // Scan messages[], extract semua image_url base64 → array of { buffer, mimetype, filename }
 // Hanya handle data: URI (base64) — HTTP URL bisa di-extend kalau perlu
 function extractImagesFromMessages(messages) {
@@ -359,6 +417,57 @@ function extractImagesFromMessages(messages) {
 
 // Vision model untuk auto-switching saat ada gambar
 const VISION_MODEL = process.env.QWEN_VISION_MODEL || "qwen3.7-plus";
+
+// Scan messages[], extract PDF/doc base64 content → array of { buffer, mimetype, filename }
+//
+// Supported input formats:
+//   1. Anthropic document part:
+//      { type:"document", source:{ type:"base64", media_type:"application/pdf", data:"..." }, title:"name.pdf" }
+//   2. OpenAI file part (custom extension):
+//      { type:"file", file:{ filename:"doc.pdf", file_data:"data:application/pdf;base64,..." } }
+const DOCUMENT_MIMES = [
+  "application/pdf",
+  "application/msword",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "text/plain", "text/csv", "text/markdown",
+];
+
+function extractDocumentsFromMessages(messages) {
+  const docs = [];
+  for (const msg of messages) {
+    if (!Array.isArray(msg.content)) continue;
+    for (const part of msg.content) {
+      // Format 1: Anthropic-style document
+      if (part.type === "document" && part.source?.type === "base64") {
+        const mimetype = part.source.media_type || "application/pdf";
+        if (!DOCUMENT_MIMES.includes(mimetype)) continue; // skip non-doc
+        const buffer = Buffer.from(part.source.data, "base64");
+        const ext    = mimetype.split("/")[1]?.split(".").pop() || "pdf";
+        docs.push({
+          buffer,
+          mimetype,
+          filename: part.title || `doc_${Date.now()}_${docs.length}.${ext}`,
+        });
+      }
+      // Format 2: OpenAI-style file part dengan file_data URI
+      if (part.type === "file" && part.file?.file_data) {
+        const m = part.file.file_data.match(/^data:([^;]+);base64,(.+)$/s);
+        if (!m) continue;
+        const mimetype = m[1];
+        if (!DOCUMENT_MIMES.includes(mimetype)) continue;
+        const buffer = Buffer.from(m[2], "base64");
+        const ext    = mimetype.split("/")[1]?.split(".").pop() || "bin";
+        docs.push({
+          buffer,
+          mimetype,
+          filename: part.file.filename || `doc_${Date.now()}_${docs.length}.${ext}`,
+        });
+      }
+    }
+  }
+  return docs;
+}
+
 
 function extractText(content) {
   if (typeof content === "string") return content;
@@ -1145,8 +1254,33 @@ const server = http.createServer((req, res) => {
       }
     }
 
+    // ── Document: detect & upload PDF/doc ───────────────────────────────
+    // Scan messages untuk Anthropic-style document parts atau OpenAI file parts.
+    // Kalau ada → upload ke Qwen OSS pakai flow STS yang sama dengan image.
+    // getSTS otomatis pakai filetype:"file" untuk PDF/doc MIME.
+    let documentFiles = [];
+    const rawDocs     = extractDocumentsFromMessages(messages);
+    if (rawDocs.length) {
+      console.log(`[Document] ${rawDocs.length} dokumen terdeteksi — upload ke Qwen OSS...`);
+      const docToken = (alive()[rrIdx % alive().length])?.token;
+      if (docToken) {
+        try {
+          const uploaded = await Promise.all(
+            rawDocs.map(doc => uploadImageToQwen(docToken, doc.buffer, doc.filename, doc.mimetype))
+          );
+          documentFiles = uploaded.map(buildDocumentFileEntry);
+          console.log(`[Document] Upload selesai: ${documentFiles.map(d => d.name).join(", ")}`);
+        } catch (e) {
+          console.warn(`[Document] Upload gagal (lanjut tanpa dokumen): ${e.message}`);
+        }
+      }
+    }
+
     const prompt = toPrompt(messages, tools, toolChoice);
     const slot   = nextSlot();
+
+    // Merge image + document files for Qwen payload
+    const allFiles = [...imageFiles, ...documentFiles];
 
     const t0 = Date.now();
     const chatId = await getSession(slot.token, activeModelId);
@@ -1177,7 +1311,7 @@ const server = http.createServer((req, res) => {
 
       try {
         const t1 = Date.now();
-        await streamQwen(slot.token, chatId, prompt, activeModelId, thinking, useSearch, res, id, tools, toolChoice, imageFiles);
+        await streamQwen(slot.token, chatId, prompt, activeModelId, thinking, useSearch, res, id, tools, toolChoice, allFiles);
         console.log(`[QwenProxy] stream done in ${Date.now()-t1}ms`);
       } catch (e) {
         const msg = e.message || "";
@@ -1239,7 +1373,7 @@ const server = http.createServer((req, res) => {
       };
 
       try {
-        await streamQwen(slot.token, chatId, prompt, activeModelId, thinking, useSearch, fakeRes, id, tools, toolChoice, imageFiles);
+        await streamQwen(slot.token, chatId, prompt, activeModelId, thinking, useSearch, fakeRes, id, tools, toolChoice, allFiles);
       } catch (e) {
         const msg = e.message || "";
         if (/401|502|rate.limit|RateLimit/i.test(msg)) { slot.dead = true; rotate(msg); }
