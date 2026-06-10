@@ -67,9 +67,9 @@ node start.js gateway       # terminal 2
 
 ---
 
-CONTEXT
-Kimi = 256k
-Deepseek V4 = 1M
+CONTEXT =
+Kimi = 256k |
+Deepseek V4 = 1M |
 qwen3.7-plus or max = 1M
 
 ## web search
