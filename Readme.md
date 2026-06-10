@@ -14,7 +14,7 @@ agents yang pake qwen / kimi,reverse api tanpa bayar API resmi. unlimited token
 
 ---
 
-## setup pertama kali
+## setup pertama kali (kalo belom ada hermes/openclaw)
 
 ```bash
 node start.js
