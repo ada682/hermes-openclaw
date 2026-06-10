@@ -1,5 +1,5 @@
 # sonnetrade - telegram = @Realsonnet
-agents using qwen / kimi model,reverse api without paying for the official API. unlimited tokens
+agents using qwen / kimi / deepseek model,reverse api without paying for the official API. unlimited tokens
 
 > 🇮🇩 [Baca dalam Bahasa Indonesia](Readme.md)
 
@@ -14,13 +14,15 @@ agents using qwen / kimi model,reverse api without paying for the official API. 
 
 ---
 
-## first time setup
+## first time setup fill the token in the .env.qwen - kimi - deepseek
 
 ```bash
-node start.js
+node start.js proxy qwen
+or
+node start.js proxy kimi
+or
+node star.js proxy deepseek
 ```
-
-follow the prompts — enter your token, telegram bot token, done.
 
 ---
 
@@ -57,33 +59,11 @@ how to get: open qwen chat → F12 → Application → Local Storage → click q
 ## how to run
 
 ```bash
-# 1 terminal
-node start.js
-
 # 2 terminals (recommended)
 node start.js proxy   # terminal 1
 # or
 node start.js gateway       # terminal 2
 ```
-Note: First, choose whether you want to use Qwen or Kimi.
-
-To do that, run:
-node start.js proxy qwen
-
-or
-
-node start.js proxy kimi
-
-Also, choose whether you want to use OpenClaw or Hermes Agent as the gateway.
-
-To do that, run:
-node start.js gateway openclaw
-
-or
-
-node start.js gateway hermes
-
-proxy choice is saved automatically, so you only need to run `node start.js proxy kimi` once.
 
 ---
 
