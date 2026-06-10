@@ -597,6 +597,34 @@ ${!isKimi ? `    TAVILY_API_KEY=tvly-xxxx...   ← ambil di https://app.tavily.c
     return;
   }
 
+  // ── Backup file asli sebelum patch ────────────────────────────────────────
+  const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const backupTargets = [
+    [HERMES_CFG, "config.yaml"],
+    [HERMES_ENV, ".env"],
+  ];
+
+  let anyBackedUp = false;
+  for (const [src, label] of backupTargets) {
+    if (fs.existsSync(src)) {
+      const bak = `${src}.backup-${ts}`;
+      try {
+        fs.copyFileSync(src, bak);
+        ok(`Backup: ${label} → ${path.basename(bak)}`);
+        anyBackedUp = true;
+      } catch (e) {
+        warn(`Gagal backup ${label}: ${e.message} — lanjut tanpa backup`);
+      }
+    } else {
+      info(`${label} belum ada, tidak perlu backup`);
+    }
+  }
+
+  if (anyBackedUp) {
+    info(`Backup tersimpan di: ${HERMES_HOME}`);
+    info(`Untuk restore manual: salin file .backup-${ts} kembali ke nama aslinya`);
+  }
+
   // ── Lakukan patch ──────────────────────────────────────────────────────────
   patchHermesConfig(proxyType);
   patchHermesEnv(proxyType);
