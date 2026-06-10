@@ -20,22 +20,37 @@ const warn = m => console.log(`${C.yellow}!${C.reset} ${m}`);
 const err  = m => console.log(`${C.red}✗${C.reset} ${m}`);
 const step = m => console.log(`\n${C.bold}${C.white}${m}${C.reset}`);
 
+// Windows tidak punya SIGTERM native — kirim sinyal yang benar sesuai platform
+const safeKill = proc => { try { proc.kill(process.platform === "win32" ? undefined : "SIGTERM"); } catch {} };
+
 const MARKER          = path.join(__dirname, ".setup-done");
 const ENV_FILE        = path.join(__dirname, ".env.qwen");
 // File kecil untuk menyimpan proxy type terakhir yang dipakai
 const PROXY_TYPE_FILE = path.join(__dirname, ".proxy-type");
 // File untuk menyimpan agent type (hermes/openclaw)
 const AGENT_TYPE_FILE = path.join(__dirname, ".agent-type");
+// Folder untuk menyimpan backup file config sebelum di-patch (subfolder per-agent)
+const BACKUP_DIR = path.join(__dirname, "backup");
 
-// Hermes config paths (Windows: %LOCALAPPDATA%\hermes, Unix: ~/.hermes)
-const HERMES_HOME = process.env.LOCALAPPDATA
-  ? path.join(process.env.LOCALAPPDATA, "hermes")
-  : path.join(os.homedir(), ".hermes");
+// ─── HERMES CONFIG PATHS ──────────────────────────────────────────────────────
+// Priority: HERMES_HOME env (override resmi) > Windows LOCALAPPDATA > Linux/VPS ~/.hermes
+// Docs: native Windows → %LOCALAPPDATA%\hermes | Linux/macOS/VPS/WSL2 → ~/.hermes
+const HERMES_HOME = (() => {
+  if (process.env.HERMES_HOME) return process.env.HERMES_HOME;
+  if (process.env.LOCALAPPDATA) return path.join(process.env.LOCALAPPDATA, "hermes"); // Windows native
+  // Linux / macOS / VPS / WSL2 — cek snap juga (beberapa distro)
+  const snapPath = path.join(os.homedir(), "snap", "hermes");
+  return fs.existsSync(snapPath) ? snapPath : path.join(os.homedir(), ".hermes");
+})();
 const HERMES_ENV  = path.join(HERMES_HOME, ".env");
 const HERMES_CFG  = path.join(HERMES_HOME, "config.yaml");
 
-// Legacy OpenClaw paths (dipakai kalau mode=openclaw)
-const CLAW_DIR    = path.join(os.homedir(), ".openclaw");
+// ─── OPENCLAW CONFIG PATHS ────────────────────────────────────────────────────
+// Priority: OPENCLAW_HOME env (override resmi) > ~/.openclaw (sama di Windows/Linux)
+// Windows native: C:\Users\<nama>\.openclaw | Linux/VPS/macOS: ~/.openclaw
+const CLAW_DIR = process.env.OPENCLAW_HOME
+  ? process.env.OPENCLAW_HOME
+  : path.join(os.homedir(), ".openclaw");
 const CLAW_CFG    = path.join(CLAW_DIR, "openclaw.json");
 
 const PROXY_JS      = path.join(__dirname, "reverse-proxy.js");
@@ -78,6 +93,114 @@ function resolveProxyType(argOverride) {
   return "qwen";
 }
 
+// ─── BACKUP HELPER ────────────────────────────────────────────────────────────
+// Set untuk mencegah double-backup file yang sama dalam satu sesi
+const backedUpThisRun = new Set();
+
+/**
+ * Backup file ke folder backup/ sebelum di-patch.
+ *  - Deteksi otomatis: kalau ini backup pertama kali file tsb, diberi label
+ *    ".first-backup" supaya user tahu mana file asli originalnya.
+ *  - Skip kalau file tidak ada atau sudah di-backup sesi ini.
+ */
+function backupFile(filePath) {
+  if (!fs.existsSync(filePath)) return null;
+  if (backedUpThisRun.has(filePath)) return null; // sudah di-backup sesi ini
+
+  // Tentukan subfolder: backup/hermes/ atau backup/openclaw/
+  // berdasarkan path file yang di-backup
+  const normFile  = path.resolve(filePath);
+  const normHermes = path.resolve(HERMES_HOME);
+  const normClaw   = path.resolve(CLAW_DIR);
+  const subDir    = normFile.startsWith(normClaw) ? "openclaw" : "hermes";
+  const backupDir = path.join(BACKUP_DIR, subDir);
+
+  if (!fs.existsSync(backupDir)) {
+    fs.mkdirSync(backupDir, { recursive: true });
+  }
+
+  const baseName = path.basename(filePath);
+
+  // Cek apakah ini backup pertama kali untuk file ini (dalam subfolder agent-nya)
+  const existingBackups = fs.readdirSync(backupDir)
+    .filter(f => f.startsWith(baseName + "_"));
+  const isFirstTime = existingBackups.length === 0;
+
+  // Format timestamp: YYYY-MM-DD_HH-MM-SS
+  const now = new Date();
+  const ts  = [
+    now.getFullYear(),
+    String(now.getMonth() + 1).padStart(2, "0"),
+    String(now.getDate()).padStart(2, "0"),
+  ].join("-") + "_" + [
+    String(now.getHours()).padStart(2, "0"),
+    String(now.getMinutes()).padStart(2, "0"),
+    String(now.getSeconds()).padStart(2, "0"),
+  ].join("-");
+
+  const label      = isFirstTime ? "first-backup" : "backup";
+  const backupName = `${baseName}_${ts}.${label}`;
+  const backupPath = path.join(backupDir, backupName);
+
+  try {
+    fs.copyFileSync(filePath, backupPath);
+    backedUpThisRun.add(filePath);
+
+    if (isFirstTime) {
+      console.log(`\n${C.cyan}╔══ BACKUP PERTAMA ══════════════════════════════════════════╗${C.reset}`);
+      console.log(`${C.cyan}║${C.reset}  File asli  : ${C.white}${filePath}${C.reset}`);
+      console.log(`${C.cyan}║${C.reset}  Disimpan   : ${C.green}backup/${subDir}/${backupName}${C.reset}`);
+      console.log(`${C.cyan}║${C.reset}  ${C.yellow}★ Ini file ORIGINAL sebelum pernah di-patch!${C.reset}`);
+      console.log(`${C.cyan}║${C.reset}  ${C.gray}Restore: cp "${backupPath}" "${filePath}"${C.reset}`);
+      console.log(`${C.cyan}╚═══════════════════════════════════════════════════════════${C.reset}\n`);
+    } else {
+      ok(`Backup: ${C.gray}${baseName}${C.reset} → ${C.green}backup/${subDir}/${backupName}${C.reset}`);
+    }
+
+    return backupPath;
+  } catch (e) {
+    warn(`Gagal backup ${baseName}: ${e.message}`);
+    return null;
+  }
+}
+
+/**
+ * Tampilkan ringkasan semua backup per agent (hermes / openclaw).
+ * ★ kuning = first-backup (file original sebelum pernah di-patch).
+ */
+function showBackupSummary() {
+  const hermesDir = path.join(BACKUP_DIR, "hermes");
+  const clawDir   = path.join(BACKUP_DIR, "openclaw");
+
+  const hermesFiles = fs.existsSync(hermesDir) ? fs.readdirSync(hermesDir).sort() : [];
+  const clawFiles   = fs.existsSync(clawDir)   ? fs.readdirSync(clawDir).sort()   : [];
+
+  if (!hermesFiles.length && !clawFiles.length) return;
+
+  console.log(`\n${C.bold}📦 Backup folder:${C.reset} ${C.cyan}${BACKUP_DIR}${C.reset}`);
+
+  if (hermesFiles.length) {
+    console.log(`  ${C.cyan}backup/hermes/${C.reset}  ${C.gray}(${HERMES_HOME})${C.reset}`);
+    hermesFiles.forEach(f => {
+      const isFirst = f.includes(".first-backup");
+      const marker  = isFirst ? `${C.yellow}★${C.reset}` : `${C.gray}·${C.reset}`;
+      const note    = isFirst ? ` ${C.yellow}← file asli original${C.reset}` : "";
+      console.log(`    ${marker} ${f}${note}`);
+    });
+  }
+
+  if (clawFiles.length) {
+    console.log(`  ${C.cyan}backup/openclaw/${C.reset}  ${C.gray}(${CLAW_DIR})${C.reset}`);
+    clawFiles.forEach(f => {
+      const isFirst = f.includes(".first-backup");
+      const marker  = isFirst ? `${C.yellow}★${C.reset}` : `${C.gray}·${C.reset}`;
+      const note    = isFirst ? ` ${C.yellow}← file asli original${C.reset}` : "";
+      console.log(`    ${marker} ${f}${note}`);
+    });
+  }
+  console.log();
+}
+
 function loadEnv() {
   // Load .env.qwen (qwen tokens)
   if (fs.existsSync(ENV_FILE)) {
@@ -103,6 +226,10 @@ function cmdExists(cmd) {
 function patchConfigHermes(tgToken) {
   // Pastikan dir ~/.hermes ada
   if (!fs.existsSync(HERMES_HOME)) fs.mkdirSync(HERMES_HOME, { recursive: true });
+
+  // Backup file asli sebelum di-modifikasi
+  backupFile(HERMES_CFG);
+  backupFile(HERMES_ENV);
 
   // --- config.yaml ---
   // Baca yang ada, atau mulai dari kosong
@@ -208,6 +335,7 @@ function patchConfigClaw(tgToken, proxyType = "qwen") {
   // Diinject terpisah via patchClawSoulMd() setelah file ini selesai ditulis.
 
   if (!fs.existsSync(CLAW_DIR)) fs.mkdirSync(CLAW_DIR, { recursive: true });
+  backupFile(CLAW_CFG);
   fs.writeFileSync(CLAW_CFG, JSON.stringify(config, null, 2));
   ok(`openclaw.json diperbarui (${proxyType} mode) → ${CLAW_CFG}`);
 }
@@ -293,7 +421,8 @@ print("OK")
     if (msg.includes("No module named 'yaml'") || msg.includes("ModuleNotFoundError")) {
       info("pyyaml belum ada, menginstall...");
       try {
-        execSync(`"${pyCmd}" -m pip install pyyaml --quiet`, { stdio: "inherit" });
+        const _bsp2 = process.platform === "win32" ? "" : " --break-system-packages";
+        execSync(`"${pyCmd}" -m pip install pyyaml --quiet${_bsp2}`, { stdio: "inherit" });
         const result2 = execSync(`"${pyCmd}" "${tmpPy}"`, { encoding: "utf8" });
         if (result2.trim() === "OK") ok(`soul.md → config.yaml (pyyaml baru diinstall)`);
       } catch (e2) {
@@ -449,7 +578,8 @@ print("OK")
     if (msg.includes("No module named 'yaml'") || msg.includes("ModuleNotFoundError")) {
       info("pyyaml belum ada, menginstall...");
       try {
-        execSync(`"${pyCmd}" -m pip install pyyaml --quiet`, { stdio: "inherit" });
+        const _bsp3 = process.platform === "win32" ? "" : " --break-system-packages";
+        execSync(`"${pyCmd}" -m pip install pyyaml --quiet${_bsp3}`, { stdio: "inherit" });
         const r2 = runPatch();
         if (r2 === "OK") ok(`config.yaml diperbarui (pyyaml baru diinstall)`);
       } catch (e2) {
@@ -555,7 +685,8 @@ print("OK")
     const msg = e.message || "";
     if (msg.includes("No module named 'yaml'") || msg.includes("ModuleNotFoundError")) {
       try {
-        execSync(`"${pyCmd}" -m pip install pyyaml --quiet`, { stdio: "inherit" });
+        const _bsp4 = process.platform === "win32" ? "" : " --break-system-packages";
+        execSync(`"${pyCmd}" -m pip install pyyaml --quiet${_bsp4}`, { stdio: "inherit" });
         const r2 = run();
         if (r2 === "OK") ok(`web search backend diperbarui`);
       } catch (e2) { warn(`Gagal patch web search backend: ${e2.message.split("\n")[0]}`); }
@@ -625,6 +756,7 @@ function patchClawConfig(proxyType = "qwen") {
   config.tools.profile = "coding";
 
   try {
+    backupFile(CLAW_CFG);
     fs.writeFileSync(CLAW_CFG, JSON.stringify(config, null, 2));
     ok(`openclaw.json → ${proxyType} mode (model=${modelId})`);
   } catch (e) {
@@ -649,19 +781,11 @@ async function maybePatchConfig(proxyType = "qwen") {
   const isKimi   = proxyType === "kimi";
   const label    = isKimi ? "Kimi" : "Qwen";
   const cfgOk    = fs.existsSync(HERMES_CFG);
-  const homeOk   = fs.existsSync(HERMES_HOME);
-
-  // Deteksi path hermes (VPS vs Windows vs lokal)
-  const hermesPath = (() => {
-    if (process.env.LOCALAPPDATA) return path.join(process.env.LOCALAPPDATA, "hermes");  // Windows
-    const snap   = path.join(os.homedir(), "snap", "hermes");
-    const dotHermes = path.join(os.homedir(), ".hermes");
-    return fs.existsSync(snap) ? snap : dotHermes;
-  })();
 
   step(`Patch Hermes config (${label} mode)`);
   console.log(`${C.gray}
   Path Hermes terdeteksi:
+    HERMES_HOME : ${HERMES_HOME}
     config.yaml : ${HERMES_CFG}
     .env        : ${HERMES_ENV}
     Ada?        : config.yaml=${cfgOk ? "✓" : "✗"}  .env=${fs.existsSync(HERMES_ENV) ? "✓" : "✗"}
@@ -731,10 +855,17 @@ ${!isKimi ? `    TAVILY_API_KEY=tvly-xxxx...   ← ambil di https://app.tavily.c
     return;
   }
 
+  // ── Backup dulu sebelum patch ──────────────────────────────────────────────
+  backupFile(HERMES_CFG);
+  backupFile(HERMES_ENV);
+
   // ── Lakukan patch ──────────────────────────────────────────────────────────
   patchHermesConfig(proxyType);
   patchHermesEnv(proxyType);
   patchWebSearchBackend(proxyType);
+
+  // ── Tampilkan semua backup yang ada ────────────────────────────────────────
+  showBackupSummary();
 
   // ── Post-patch info ────────────────────────────────────────────────────────
   if (!isKimi) {
@@ -771,7 +902,11 @@ ${C.yellow}⚠  Web Search untuk Qwen butuh Tavily API key!${C.reset}
   // Soul.md — ditanya paling terakhir setelah semua patch & info selesai
   if (fs.existsSync(SOUL_MD) && fs.existsSync(HERMES_CFG)) {
     const patchSoul = await askYN(`Patch soul.md → config.yaml? (${fs.statSync(SOUL_MD).size} bytes)`);
-    if (patchSoul) patchSoulMd();
+    if (patchSoul) {
+      backupFile(HERMES_CFG); // no-op kalau sudah di-backup sesi ini
+      patchSoulMd();
+      showBackupSummary();
+    }
     else info("soul.md skip.");
   } else {
     patchSoulMd();
@@ -803,7 +938,8 @@ async function runSetup() {
     } else {
       info("Menginstall hermes-agent secara global...");
       try {
-        execSync("pip install hermes-agent --break-system-packages", { stdio: "inherit" });
+        const _bsp1 = process.platform === "win32" ? "" : " --break-system-packages";
+        execSync(`pip install hermes-agent${_bsp1}`, { stdio: "inherit" });
         ok("hermes: " + execSync("hermes --version", { encoding: "utf8" }).trim());
       } catch {
         err("Install gagal. Coba manual: pip install hermes-agent");
@@ -869,7 +1005,7 @@ ${C.reset}`);
 
   if (AGENT === "hermes") {
     console.log(`${C.yellow}
-  Sekarang hermes gateway setup akan tanya beberapa hal.
+  Sekarang hermes setup gateway akan tanya beberapa hal.
   Ikuti langkah berikut:
 
   ❶  Pilih platform → pilih "Telegram"
@@ -896,7 +1032,7 @@ ${C.reset}`);
     await new Promise(r => setTimeout(r, 2000));
     ok("Proxy siap di http://127.0.0.1:4891/v1");
 
-    const onboard = spawnSync("hermes", ["gateway", "setup"], {
+    const onboard = spawnSync("hermes", ["setup", "gateway"], {
       stdio: "inherit",
       shell: true,
     });
@@ -1022,7 +1158,7 @@ function startProxy(proxyType) {
       stdio: "inherit",
     });
     proxy.on("exit", code => { if (code) err(`Kimi proxy berhenti (kode ${code})`); process.exit(code || 0); });
-    process.on("SIGINT", () => { proxy.kill("SIGTERM"); setTimeout(() => process.exit(0), 500); });
+    process.on("SIGINT", () => { safeKill(proxy); setTimeout(() => process.exit(0), 500); });
   } else {
     ensureConfig("qwen");
     console.log(`\n${C.bold}${C.cyan}[ Qwen Reverse Proxy ]${C.reset}\n`);
@@ -1032,7 +1168,7 @@ function startProxy(proxyType) {
       stdio: "inherit",
     });
     proxy.on("exit", code => { if (code) err(`Proxy berhenti (kode ${code})`); process.exit(code || 0); });
-    process.on("SIGINT", () => { proxy.kill("SIGTERM"); setTimeout(() => process.exit(0), 500); });
+    process.on("SIGINT", () => { safeKill(proxy); setTimeout(() => process.exit(0), 500); });
   }
 }
 
@@ -1065,7 +1201,7 @@ async function startGateway() {
     shell: true,
   });
   gw.on("exit", code => process.exit(code || 0));
-  process.on("SIGINT", () => { gw.kill("SIGTERM"); setTimeout(() => process.exit(0), 500); });
+  process.on("SIGINT", () => { safeKill(gw); setTimeout(() => process.exit(0), 500); });
 }
 
 async function runAll() {
@@ -1119,9 +1255,9 @@ async function runAll() {
       stdio: ["inherit", "inherit", "inherit"],
       shell: true,
     });
-    gw.on("exit", code => { proxy.kill(); process.exit(code || 0); });
+    gw.on("exit", code => { safeKill(proxy); process.exit(code || 0); });
     process.on("SIGINT", () => {
-      gw.kill("SIGTERM"); proxy.kill("SIGTERM");
+      safeKill(gw); safeKill(proxy);
       setTimeout(() => process.exit(0), 1000);
     });
   }, 1500);
