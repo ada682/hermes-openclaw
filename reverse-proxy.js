@@ -29,6 +29,26 @@ const SHOW_THINKING = process.env.QWEN_SHOW_THINKING === "true";
 // Override with QWEN_DEFAULT_THINKING=Auto or QWEN_DEFAULT_THINKING=Thinking if needed.
 const DEFAULT_THINKING = process.env.QWEN_DEFAULT_THINKING || "Fast";
 
+// Stream timeout + retry (port dari kimi-reverse-proxy)
+// QWEN_STREAM_IDLE_TIMEOUT  — ms tanpa data sebelum stream dianggap hang (default: 90s)
+// QWEN_STREAM_TOTAL_TIMEOUT — hard cap per stream request (default: 5min)
+// QWEN_RETRY_MAX            — max retry attempts saat timeout (default: 3)
+// QWEN_RETRY_DELAY          — base delay ms × attempt# untuk tiap retry (default: 3000)
+const STREAM_IDLE_TIMEOUT_MS  = parseInt(process.env.QWEN_STREAM_IDLE_TIMEOUT  || "90000",  10);
+const STREAM_TOTAL_TIMEOUT_MS = parseInt(process.env.QWEN_STREAM_TOTAL_TIMEOUT || "300000", 10);
+const RETRY_MAX               = parseInt(process.env.QWEN_RETRY_MAX            || "3",      10);
+const RETRY_DELAY             = parseInt(process.env.QWEN_RETRY_DELAY          || "3000",   10);
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+/**
+ * Thrown when the Qwen stream hangs (idle timeout atau total timeout).
+ * Ditangkap oleh streamQwenWithRetry untuk trigger retry ke slot lain.
+ */
+class StreamTimeoutError extends Error {
+  constructor(msg) { super(msg); this.name = "StreamTimeoutError"; this.isTimeout = true; }
+}
+
 // ── Persistent HTTPS agent ────────────────────────────────────────────────
 const AGENT = new https.Agent({
   keepAlive:      true,
@@ -64,7 +84,7 @@ if (!POOL.length) {
   console.error("[QwenProxy] ERROR: Tidak ada token! Set QWEN_TOKEN_1 dulu.");
   process.exit(1);
 }
-console.log(`[QwenProxy] ${POOL.length} token dimuat | port=${PORT} | model=${DEFAULT_MODEL} | showThinking=${SHOW_THINKING} | defaultThinking=${DEFAULT_THINKING}`);
+console.log(`[QwenProxy] ${POOL.length} token dimuat | port=${PORT} | model=${DEFAULT_MODEL} | showThinking=${SHOW_THINKING} | defaultThinking=${DEFAULT_THINKING} | idleTimeout=${STREAM_IDLE_TIMEOUT_MS/1000}s | totalTimeout=${STREAM_TOTAL_TIMEOUT_MS/1000}s | retryMax=${RETRY_MAX}`);
 
 // ── Chat session pre-warm pool ────────────────────────────────────────────
 const SESSION_POOL   = new Map();
@@ -337,64 +357,6 @@ function buildImageFileEntry(info) {
   };
 }
 
-// ═════════════════════════════════════════════════════════════════════════
-// ── Document Upload (PDF, Word, dll) ──────────────────────────────────────
-// ═════════════════════════════════════════════════════════════════════════
-//
-// STS flow identik dengan image upload — getSTS sudah otomatis pakai
-// filetype:"file" untuk non-image MIME.  Yang berbeda hanya format entry
-// files[] yang dikirim ke Qwen (lebih lengkap, ada nested `file` object).
-//
-// Accepted input formats dari client:
-//   1. Anthropic-style document part:
-//      { type: "document", source: { type: "base64", media_type: "application/pdf", data: "..." } }
-//   2. OpenAI-style file part (custom):
-//      { type: "file", file: { filename: "doc.pdf", file_data: "data:application/pdf;base64,..." } }
-
-// Format document info → entry files[] yang dikenali Qwen
-function buildDocumentFileEntry(info) {
-  const now    = Date.now();
-  const fileId = info.file_id || uuid();
-  return {
-    type:            "file",
-    name:            info.filename || "document.pdf",
-    url:             info.file_url || "",
-    size:            info.filesize || 0,
-    id:              fileId,
-    fileId:          fileId,
-    itemId:          uuid(),
-    uploadTaskId:    uuid(),
-    fileClass:       "document",
-    file_type:       info.mimetype || "application/pdf",
-    showType:        "file",
-    status:          "uploaded",
-    greenNet:        "success",
-    collection_name: "",
-    error:           "",
-    progress:        0,
-    // Nested file object — dipakai Qwen untuk parsing & referensi
-    file: {
-      id:                 fileId,
-      filename:           info.filename || "document.pdf",
-      name:               info.filename || "document.pdf",
-      size:               info.filesize || 0,
-      type:               info.mimetype || "application/pdf",
-      hash:               null,
-      webkitRelativePath: "",
-      data:               {},
-      created_at:         now,
-      update_at:          now,
-      lastModified:       now,
-      meta: {
-        name:         info.filename || "document.pdf",
-        size:         info.filesize || 0,
-        content_type: info.mimetype || "application/pdf",
-        parse_meta:   { parse_status: "success" },
-      },
-    },
-  };
-}
-
 // Scan messages[], extract semua image_url base64 → array of { buffer, mimetype, filename }
 // Hanya handle data: URI (base64) — HTTP URL bisa di-extend kalau perlu
 function extractImagesFromMessages(messages) {
@@ -417,57 +379,6 @@ function extractImagesFromMessages(messages) {
 
 // Vision model untuk auto-switching saat ada gambar
 const VISION_MODEL = process.env.QWEN_VISION_MODEL || "qwen3.7-plus";
-
-// Scan messages[], extract PDF/doc base64 content → array of { buffer, mimetype, filename }
-//
-// Supported input formats:
-//   1. Anthropic document part:
-//      { type:"document", source:{ type:"base64", media_type:"application/pdf", data:"..." }, title:"name.pdf" }
-//   2. OpenAI file part (custom extension):
-//      { type:"file", file:{ filename:"doc.pdf", file_data:"data:application/pdf;base64,..." } }
-const DOCUMENT_MIMES = [
-  "application/pdf",
-  "application/msword",
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  "text/plain", "text/csv", "text/markdown",
-];
-
-function extractDocumentsFromMessages(messages) {
-  const docs = [];
-  for (const msg of messages) {
-    if (!Array.isArray(msg.content)) continue;
-    for (const part of msg.content) {
-      // Format 1: Anthropic-style document
-      if (part.type === "document" && part.source?.type === "base64") {
-        const mimetype = part.source.media_type || "application/pdf";
-        if (!DOCUMENT_MIMES.includes(mimetype)) continue; // skip non-doc
-        const buffer = Buffer.from(part.source.data, "base64");
-        const ext    = mimetype.split("/")[1]?.split(".").pop() || "pdf";
-        docs.push({
-          buffer,
-          mimetype,
-          filename: part.title || `doc_${Date.now()}_${docs.length}.${ext}`,
-        });
-      }
-      // Format 2: OpenAI-style file part dengan file_data URI
-      if (part.type === "file" && part.file?.file_data) {
-        const m = part.file.file_data.match(/^data:([^;]+);base64,(.+)$/s);
-        if (!m) continue;
-        const mimetype = m[1];
-        if (!DOCUMENT_MIMES.includes(mimetype)) continue;
-        const buffer = Buffer.from(m[2], "base64");
-        const ext    = mimetype.split("/")[1]?.split(".").pop() || "bin";
-        docs.push({
-          buffer,
-          mimetype,
-          filename: part.file.filename || `doc_${Date.now()}_${docs.length}.${ext}`,
-        });
-      }
-    }
-  }
-  return docs;
-}
-
 
 function extractText(content) {
   if (typeof content === "string") return content;
@@ -805,7 +716,44 @@ function streamQwen(token, chatId, prompt, modelId, thinking, useSearch, res, id
       let imageGenDone  = false; // deduplicate image_gen_tool output
       let resolved      = false; // guard against double-emit on status:finished + stream end
 
+      // ── Stream timeouts ───────────────────────────────────────────────────
+      // Qwen kadang biarkan koneksi hidup tanpa kirim data / status:finished.
+      // Tanpa timer ini proxy nunggu selamanya.
+      // - IDLE timeout  : reset setiap kali ada chunk data masuk
+      // - TOTAL timeout : hard cap untuk satu stream, apapun yang terjadi
+      let _idleTimer  = null;
+      let _totalTimer = null;
+
+      function _clearTimers() {
+        if (_idleTimer)  { clearTimeout(_idleTimer);  _idleTimer  = null; }
+        if (_totalTimer) { clearTimeout(_totalTimer); _totalTimer = null; }
+      }
+
+      function _kickIdle() {
+        if (_idleTimer) clearTimeout(_idleTimer);
+        _idleTimer = setTimeout(() => {
+          if (resolved) return;
+          _clearTimers();
+          resolved = true;
+          console.error(`[QwenProxy] ✗ stream idle timeout — tidak ada data selama ${STREAM_IDLE_TIMEOUT_MS/1000}s`);
+          try { qwenRes.destroy(); } catch {}
+          reject(new StreamTimeoutError(`Qwen stream idle timeout (${STREAM_IDLE_TIMEOUT_MS/1000}s)`));
+        }, STREAM_IDLE_TIMEOUT_MS);
+      }
+
+      _totalTimer = setTimeout(() => {
+        if (resolved) return;
+        _clearTimers();
+        resolved = true;
+        console.error(`[QwenProxy] ✗ stream total timeout — melebihi ${STREAM_TOTAL_TIMEOUT_MS/1000}s`);
+        try { qwenRes.destroy(); } catch {}
+        reject(new StreamTimeoutError(`Qwen stream total timeout (${STREAM_TOTAL_TIMEOUT_MS/1000}s)`));
+      }, STREAM_TOTAL_TIMEOUT_MS);
+
+      _kickIdle(); // mulai idle timer dari saat response headers diterima
+
       qwenRes.on("data", raw => {
+        _kickIdle(); // reset idle timer setiap ada data masuk
         buf += raw.toString();
         const lines = buf.split("\n");
         buf = lines.pop() || "";
@@ -944,6 +892,7 @@ function streamQwen(token, chatId, prompt, modelId, thinking, useSearch, res, id
               // double-emit when qwenRes.on("end") fires afterward.
               if (status === "finished" && activeTools && hasToolUse(answerBuf) && !resolved) {
                 resolved = true;
+                _clearTimers();
                 emitToolCalls(res, id, modelId, answerBuf);
                 res.write("data: [DONE]\n\n");
                 resolve();
@@ -957,6 +906,7 @@ function streamQwen(token, chatId, prompt, modelId, thinking, useSearch, res, id
       });
 
       qwenRes.on("end", () => {
+        _clearTimers();
         if (resolved) return; // already handled by status:finished early-exit
         resolved = true;
 
@@ -993,12 +943,58 @@ function streamQwen(token, chatId, prompt, modelId, thinking, useSearch, res, id
         res.write("data: [DONE]\n\n");
         resolve();
       });
+      qwenRes.on("error", e => { _clearTimers(); if (!resolved) { resolved = true; reject(e); } });
     });
 
     req.on("error", reject);
     req.write(payload);
     req.end();
   });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ── Stream timeout retry wrapper ──────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Wraps streamQwen dengan retry otomatis saat stream timeout (idle atau total).
+ *
+ * Retry strategy:
+ *   attempt 1 → timeout → ganti slot → attempt 2
+ *   attempt 2 → timeout → ganti slot → attempt 3
+ *   attempt N → timeout → give up, throw ke HTTP handler
+ *
+ * Untuk SSE streaming, SSE comment ditulis selama jeda supaya koneksi TCP
+ * ke client (Hermes / OpenClaw) tetap hidup.
+ *
+ * @param {boolean} isStreaming – true → write SSE keep-alive comments saat wait
+ */
+async function streamQwenWithRetry(token, chatId, prompt, modelId, thinking, useSearch, res, id, tools, toolChoice, imageFiles, isStreaming = false) {
+  let curToken  = token;
+  let curChatId = chatId;
+  for (let attempt = 0; attempt <= RETRY_MAX; attempt++) {
+    try {
+      await streamQwen(curToken, curChatId, prompt, modelId, thinking, useSearch, res, id, tools, toolChoice, imageFiles);
+      if (attempt > 0) console.log(`[QwenProxy] ✓ retry berhasil di attempt ${attempt + 1}`);
+      return; // ✓ success
+    } catch (e) {
+      const retryable = e.isTimeout && attempt < RETRY_MAX;
+      if (retryable) {
+        console.warn(`[QwenProxy] ⚠ Stream timeout (attempt ${attempt + 1}/${RETRY_MAX + 1}) — ganti slot segera...`);
+        if (isStreaming) {
+          try { res.write(`: qwen stream timeout, retrying slot lain...\n\n`); } catch {}
+        }
+        // Rotasi ke slot berikutnya, buat session baru
+        rotate("stream timeout retry");
+        const newSlot = current();
+        curToken  = newSlot.token;
+        curChatId = await getSession(curToken, modelId) || curChatId;
+      } else {
+        if (e.isTimeout) console.error(`[QwenProxy] ✗ Stream timeout after ${RETRY_MAX + 1} attempts — giving up.`);
+        throw e;
+      }
+    }
+  }
 }
 
 /**
@@ -1254,33 +1250,8 @@ const server = http.createServer((req, res) => {
       }
     }
 
-    // ── Document: detect & upload PDF/doc ───────────────────────────────
-    // Scan messages untuk Anthropic-style document parts atau OpenAI file parts.
-    // Kalau ada → upload ke Qwen OSS pakai flow STS yang sama dengan image.
-    // getSTS otomatis pakai filetype:"file" untuk PDF/doc MIME.
-    let documentFiles = [];
-    const rawDocs     = extractDocumentsFromMessages(messages);
-    if (rawDocs.length) {
-      console.log(`[Document] ${rawDocs.length} dokumen terdeteksi — upload ke Qwen OSS...`);
-      const docToken = (alive()[rrIdx % alive().length])?.token;
-      if (docToken) {
-        try {
-          const uploaded = await Promise.all(
-            rawDocs.map(doc => uploadImageToQwen(docToken, doc.buffer, doc.filename, doc.mimetype))
-          );
-          documentFiles = uploaded.map(buildDocumentFileEntry);
-          console.log(`[Document] Upload selesai: ${documentFiles.map(d => d.name).join(", ")}`);
-        } catch (e) {
-          console.warn(`[Document] Upload gagal (lanjut tanpa dokumen): ${e.message}`);
-        }
-      }
-    }
-
     const prompt = toPrompt(messages, tools, toolChoice);
     const slot   = nextSlot();
-
-    // Merge image + document files for Qwen payload
-    const allFiles = [...imageFiles, ...documentFiles];
 
     const t0 = Date.now();
     const chatId = await getSession(slot.token, activeModelId);
@@ -1311,11 +1282,11 @@ const server = http.createServer((req, res) => {
 
       try {
         const t1 = Date.now();
-        await streamQwen(slot.token, chatId, prompt, activeModelId, thinking, useSearch, res, id, tools, toolChoice, allFiles);
+        await streamQwenWithRetry(slot.token, chatId, prompt, activeModelId, thinking, useSearch, res, id, tools, toolChoice, imageFiles, true);
         console.log(`[QwenProxy] stream done in ${Date.now()-t1}ms`);
       } catch (e) {
         const msg = e.message || "";
-        console.error("[QwenProxy] stream error:", msg);
+        console.error("[QwenProxy] stream error (all retries exhausted):", msg);
         // ECONNRESET/ETIMEDOUT = Qwen nutup koneksi paksa → rotate token
         if (/401|502|rate.limit|RateLimit|ECONNRESET|ETIMEDOUT|ECONNREFUSED/i.test(msg)) {
           slot.dead = true; rotate(msg);
@@ -1373,7 +1344,7 @@ const server = http.createServer((req, res) => {
       };
 
       try {
-        await streamQwen(slot.token, chatId, prompt, activeModelId, thinking, useSearch, fakeRes, id, tools, toolChoice, allFiles);
+        await streamQwenWithRetry(slot.token, chatId, prompt, activeModelId, thinking, useSearch, fakeRes, id, tools, toolChoice, imageFiles, false);
       } catch (e) {
         const msg = e.message || "";
         if (/401|502|rate.limit|RateLimit/i.test(msg)) { slot.dead = true; rotate(msg); }
