@@ -73,12 +73,7 @@ proxy choice is saved automatically, so you only need to run `node start.js prox
 
 ## web search
 
-- **kimi** — built-in, no extra setup needed
-- **qwen** — requires a Tavily key in `~/.hermes/.env`:
-  ```
-  TAVILY_API_KEY=tvly-xxxx...
-  ```
-  or use the free alternative: change `search_backend: ddgs` in `~/.hermes/config.yaml`
+built-in
 
 ---
 
