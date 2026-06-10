@@ -23,6 +23,17 @@ const step = m => console.log(`\n${C.bold}${C.white}${m}${C.reset}`);
 // Windows tidak punya SIGTERM native — kirim sinyal yang benar sesuai platform
 const safeKill = proc => { try { proc.kill(process.platform === "win32" ? undefined : "SIGTERM"); } catch {} };
 
+// ─── NON-INTERACTIVE / VPS FIX ───────────────────────────────────────────────
+// --yes / -y       → jawab semua Y/N prompt biasa dengan default (berguna di VPS tanpa TTY)
+// --patch-soul     → paksa patch soul.md tanpa tanya (non-TTY)
+// --no-patch-soul  → paksa skip soul.md tanpa tanya (non-TTY)
+const FORCE_YES      = process.argv.includes("--yes") || process.argv.includes("-y");
+const SOUL_FLAG      = process.argv.includes("--patch-soul")    ? "yes"
+                     : process.argv.includes("--no-patch-soul") ? "no"
+                     : null;  // null = tanya interaktif (default)
+// Deteksi otomatis: stdin bukan TTY = non-interactive (PM2, nohup, panel web, dll)
+const IS_TTY         = !!process.stdin.isTTY;
+
 const MARKER          = path.join(__dirname, ".setup-done");
 const ENV_FILE        = path.join(__dirname, ".env.qwen");
 // File kecil untuk menyimpan proxy type terakhir yang dipakai
@@ -438,11 +449,50 @@ print("OK")
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
-/** Tanya Y/N — default yes */
-function askYN(question, defaultYes = true) {
+/**
+ * Tanya Y/N.
+ * @param {string}  question    - teks pertanyaan
+ * @param {boolean} defaultYes  - nilai default kalau Enter / auto
+ * @param {boolean} mustChoose  - true = prompt KRITIS, tidak boleh di-auto-yes;
+ *                                kalau non-TTY → default NO + tampilkan instruksi flag
+ */
+function askYN(question, defaultYes = true, mustChoose = false) {
   return new Promise(resolve => {
     const hint = defaultYes ? "[Y/n]" : "[y/N]";
-    const rl2  = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+    // Prompt KRITIS (mustChoose=true): tidak boleh di-auto-yes secara buta
+    if (mustChoose && !IS_TTY) {
+      // Cek apakah user sudah eksplisit kasih flag --patch-soul / --no-patch-soul
+      if (SOUL_FLAG === "yes") {
+        console.log(`  ${question} ${hint}: Y  ${C.gray}(--patch-soul flag)${C.reset}`);
+        resolve(true);
+      } else if (SOUL_FLAG === "no") {
+        console.log(`  ${question} ${hint}: N  ${C.gray}(--no-patch-soul flag)${C.reset}`);
+        resolve(false);
+      } else {
+        // Tidak ada flag → default NO + tampilkan petunjuk
+        console.log(`\n${C.yellow}⚠  Prompt ini butuh pilihan manual, tapi stdin bukan TTY.${C.reset}`);
+        console.log(`   ${C.cyan}${question}${C.reset}`);
+        console.log(`   Untuk mengontrolnya, tambahkan flag saat jalankan:`);
+        console.log(`     ${C.green}--patch-soul${C.reset}    → otomatis patch soul.md`);
+        console.log(`     ${C.yellow}--no-patch-soul${C.reset} → otomatis skip soul.md`);
+        console.log(`   Contoh: ${C.cyan}node start.js gateway --patch-soul${C.reset}\n`);
+        console.log(`   ${C.gray}Sekarang: skip soul.md (default aman)${C.reset}\n`);
+        resolve(false);
+      }
+      return;
+    }
+
+    // Prompt biasa (mustChoose=false): boleh auto kalau non-TTY atau --yes
+    if (!mustChoose && (FORCE_YES || !IS_TTY)) {
+      const defLabel = defaultYes ? "Y" : "N";
+      const reason   = FORCE_YES ? "--yes flag" : "stdin bukan TTY";
+      console.log(`  ${question} ${hint}: ${defLabel}  ${C.gray}(auto: ${reason})${C.reset}`);
+      resolve(defaultYes);
+      return;
+    }
+
+    const rl2 = readline.createInterface({ input: process.stdin, output: process.stdout });
     rl2.question(`  ${question} ${hint}: `, ans => {
       rl2.close();
       const a = ans.trim().toLowerCase();
@@ -899,9 +949,9 @@ ${C.yellow}⚠  Web Search untuk Qwen butuh Tavily API key!${C.reset}
     info("Tidak perlu API key tambahan untuk web search.");
   }
 
-  // Soul.md — ditanya paling terakhir setelah semua patch & info selesai
+  // Soul.md — prompt KRITIS, user harus pilih sendiri (mustChoose=true)
   if (fs.existsSync(SOUL_MD) && fs.existsSync(HERMES_CFG)) {
-    const patchSoul = await askYN(`Patch soul.md → config.yaml? (${fs.statSync(SOUL_MD).size} bytes)`);
+    const patchSoul = await askYN(`Patch soul.md → config.yaml? (${fs.statSync(SOUL_MD).size} bytes)`, true, true);
     if (patchSoul) {
       backupFile(HERMES_CFG); // no-op kalau sudah di-backup sesi ini
       patchSoulMd();
