@@ -10,6 +10,8 @@
  *  • Live streaming + tools   – text streamed until [function_calls] marker is detected
  *  • Model-suffix thinking    – append -think / -thinking / -fast to any model name
  *  • tool_choice              – "none" suppresses injection; "required" forces call in prompt
+ *  • Native web search        – auto-detect tool "web_search" di tools[] → auto_search:true
+ *                               tool web_search di-strip dari custom tools (Qwen handle native)
  *
  * New env vars:
  *   QWEN_SHOW_THINKING=true   – emit reasoning_content delta for thinking/summary phases
@@ -1209,7 +1211,35 @@ const server = http.createServer((req, res) => {
     const messages   = parsed.messages || [];
     const tools      = parsed.tools || [];
     const toolChoice = parsed.tool_choice ?? "auto";
-    const useSearch  = req.headers["x-qwen-search"] === "true";
+
+    // Web search detection — sama seperti Kimi proxy:
+    //   1. x-qwen-search: true header  → aktifkan Qwen native auto_search
+    //   2. enable_search param          → aktifkan Qwen native auto_search
+    //   3. ada tool bernama "web_search" di tools[] → aktifkan native, strip dari custom tools
+    //
+    // Kalau native search aktif, web_search di-strip dari tools[] supaya Qwen
+    // tidak mencoba memanggil [function_calls] untuk search — Qwen handle sendiri via auto_search.
+    const NATIVE_SEARCH_TOOL_NAMES = ["web_search", "search", "browser_search", "web_browse", "web_extract"];
+    const hasNativeSearchTool = tools.some(t => {
+      const n = (t.function?.name || t.name || "").toLowerCase();
+      return NATIVE_SEARCH_TOOL_NAMES.includes(n);
+    });
+
+    const useSearch = req.headers["x-qwen-search"] === "true" ||
+                      parsed.enable_search === true ||
+                      hasNativeSearchTool;
+
+    // Strip web_search dari tools kalau native search aktif — Qwen handle sendiri
+    const activeToolList = useSearch
+      ? tools.filter(t => !NATIVE_SEARCH_TOOL_NAMES.includes((t.function?.name || t.name || "").toLowerCase()))
+      : tools;
+
+    if (useSearch) {
+      const reason = req.headers["x-qwen-search"] === "true" ? "x-qwen-search header"
+                   : parsed.enable_search === true           ? "enable_search param"
+                   : "web_search tool detected";
+      console.log(`[QwenProxy] Qwen native auto_search aktif (${reason})${hasNativeSearchTool ? " | web_search di-strip dari custom tools" : ""}`);
+    }
 
     // ── Resolve model + thinking mode ───────────────────────────────────
     // Priority: model-name suffix > enable_thinking param > "Auto"
@@ -1219,7 +1249,7 @@ const server = http.createServer((req, res) => {
         : parsed.enable_thinking === false ? "Fast"
         : DEFAULT_THINKING);
 
-    console.log(`[QwenProxy] ← model=${rawModel} → ${modelId} | msgs=${messages.length} tools=${tools.length} thinking=${thinking} tool_choice=${JSON.stringify(toolChoice)}`);
+    console.log(`[QwenProxy] ← model=${rawModel} → ${modelId} | msgs=${messages.length} tools=${activeToolList.length} thinking=${thinking} search=${useSearch} tool_choice=${JSON.stringify(toolChoice)}`);
 
     // ── Vision: detect & upload images ──────────────────────────────────
     // Scan messages untuk OpenAI multimodal content (type:"image_url").
@@ -1250,7 +1280,7 @@ const server = http.createServer((req, res) => {
       }
     }
 
-    const prompt = toPrompt(messages, tools, toolChoice);
+    const prompt = toPrompt(messages, activeToolList, toolChoice);
     const slot   = nextSlot();
 
     const t0 = Date.now();
@@ -1282,7 +1312,7 @@ const server = http.createServer((req, res) => {
 
       try {
         const t1 = Date.now();
-        await streamQwenWithRetry(slot.token, chatId, prompt, activeModelId, thinking, useSearch, res, id, tools, toolChoice, imageFiles, true);
+        await streamQwenWithRetry(slot.token, chatId, prompt, activeModelId, thinking, useSearch, res, id, activeToolList, toolChoice, imageFiles, true);
         console.log(`[QwenProxy] stream done in ${Date.now()-t1}ms`);
       } catch (e) {
         const msg = e.message || "";
@@ -1344,7 +1374,7 @@ const server = http.createServer((req, res) => {
       };
 
       try {
-        await streamQwenWithRetry(slot.token, chatId, prompt, activeModelId, thinking, useSearch, fakeRes, id, tools, toolChoice, imageFiles, false);
+        await streamQwenWithRetry(slot.token, chatId, prompt, activeModelId, thinking, useSearch, fakeRes, id, activeToolList, toolChoice, imageFiles, false);
       } catch (e) {
         const msg = e.message || "";
         if (/401|502|rate.limit|RateLimit/i.test(msg)) { slot.dead = true; rotate(msg); }
