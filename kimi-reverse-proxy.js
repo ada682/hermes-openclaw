@@ -42,6 +42,24 @@ const REFRESH_BUFFER   = 300_000; // refresh 5 menit sebelum expire (ms)
 const OVERLOADED_RETRY_MAX   = parseInt(process.env.KIMI_OVERLOADED_RETRY  || "3",    10); // max retry attempts
 const OVERLOADED_RETRY_DELAY = parseInt(process.env.KIMI_OVERLOADED_DELAY  || "3000", 10); // base delay ms (x attempt#)
 const IMAGE_CACHE_TTL_MS     = parseInt(process.env.KIMI_IMAGE_CACHE_TTL   || String(10 * 60 * 1000), 10); // default: 10 min
+const DOC_CACHE_TTL_MS       = parseInt(process.env.KIMI_DOC_CACHE_TTL     || String(30 * 60 * 1000), 10); // default: 30 min
+
+// MIME types yang dianggap dokumen (bukan gambar)
+const DOC_MIME_TYPES = new Set([
+  "application/pdf",
+  "application/msword",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.ms-excel",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.ms-powerpoint",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  "text/plain",
+  "text/csv",
+  "text/markdown",
+]);
+function isDocMime(m) {
+  return DOC_MIME_TYPES.has((m || "").toLowerCase().split(";")[0].trim());
+}
 const STREAM_IDLE_TIMEOUT_MS  = parseInt(process.env.KIMI_STREAM_IDLE_TIMEOUT  || "90000",  10); // 90s tanpa data → hang
 const STREAM_TOTAL_TIMEOUT_MS = parseInt(process.env.KIMI_STREAM_TOTAL_TIMEOUT || "300000", 10); // 5min hard cap
 
@@ -89,6 +107,31 @@ function _recentFileIds() {
   const cutoff = Date.now() - IMAGE_CACHE_TTL_MS;
   while (_recentUploads.length && _recentUploads[0].ts < cutoff) _recentUploads.shift();
   return [...new Set(_recentUploads.map(r => r.fileId))];
+}
+
+// ── Document file-ID cache ──────────────────────────────────────────────────
+// Sama seperti image cache tapi TTL lebih panjang (30 menit default)
+// karena PDF/dokumen butuh waktu lebih lama untuk diproses Kimi.
+const _docHashMap       = new Map();
+const _recentDocUploads = [];
+
+function _docCacheStore(hash, fileId) {
+  const ts = Date.now();
+  _docHashMap.set(hash, { fileId, ts });
+  _recentDocUploads.push({ fileId, ts });
+}
+
+function _docCacheGet(hash) {
+  const e = _docHashMap.get(hash);
+  if (!e) return null;
+  if (Date.now() - e.ts > DOC_CACHE_TTL_MS) { _docHashMap.delete(hash); return null; }
+  return e.fileId;
+}
+
+function _recentDocFileIds() {
+  const cutoff = Date.now() - DOC_CACHE_TTL_MS;
+  while (_recentDocUploads.length && _recentDocUploads[0].ts < cutoff) _recentDocUploads.shift();
+  return [...new Set(_recentDocUploads.map(r => r.fileId))];
 }
 
 // ── HTTPS agent ─────────────────────────────────────────────────────────────
@@ -286,7 +329,7 @@ if (!POOL.length) {
   console.error("[KimiProxy] ERROR: Tidak ada token! Set KIMI_TOKEN_1 dulu.");
   process.exit(1);
 }
-console.log(`[KimiProxy] ${POOL.length} token dimuat | port=${PORT} | model=${DEFAULT_MODEL} | showThinking=${SHOW_THINKING}`);
+console.log(`[KimiProxy] ${POOL.length} token dimuat | port=${PORT} | model=${DEFAULT_MODEL} | showThinking=${SHOW_THINKING} | imgCache=${IMAGE_CACHE_TTL_MS/60000}m | docCache=${DOC_CACHE_TTL_MS/60000}m`);
 
 let rrIdx = 0;
 function alive() {
@@ -537,6 +580,7 @@ function extractImagesFromMessages(messages) {
       const m   = url.match(/^data:([^;]+);base64,(.+)$/s);
       if (!m) continue;
       const mimetype = m[1];
+      if (isDocMime(mimetype)) continue;          // dokumen dihandle extractDocsFromMessages
       const buf      = Buffer.from(m[2], "base64");
       const ext      = mimetype.split("/")[1]?.split("+")[0] || "jpg";
       const hash     = _imgHash(buf);
@@ -544,6 +588,46 @@ function extractImagesFromMessages(messages) {
     }
   }
   return images;
+}
+
+/** Scan OpenAI messages[] → extract base64-encoded documents (PDF, DOCX, dll) */
+function extractDocsFromMessages(messages) {
+  const docs = [];
+  for (const msg of messages) {
+    if (!Array.isArray(msg.content)) continue;
+    for (const part of msg.content) {
+      let mimetype = "";
+      let b64      = "";
+      let filename = "";
+
+      // Format 1: Anthropic-style document block
+      // { type: "document", source: { type: "base64", media_type: "application/pdf", data: "..." } }
+      if (part.type === "document" && part.source?.type === "base64") {
+        mimetype = (part.source.media_type || "").toLowerCase().split(";")[0].trim();
+        b64      = part.source.data || "";
+        filename = part.name || "";
+
+      // Format 2: data: URL di image_url / file_url / url (beberapa framework salah pakai)
+      } else {
+        const raw = part.image_url?.url || part.file_url?.url || part.url || "";
+        const m   = raw.match(/^data:([^;]+);base64,(.+)$/s);
+        if (!m) continue;
+        mimetype = m[1].toLowerCase().split(";")[0].trim();
+        b64      = m[2];
+        filename = part.file_url?.filename || part.name || "";
+      }
+
+      if (!isDocMime(mimetype)) continue;
+      if (!b64) continue;
+
+      const buf = Buffer.from(b64, "base64");
+      const ext = mimetype.split("/")[1]?.split(".").pop()?.split("-").pop() || "bin";
+      const hash = _imgHash(buf);                 // reuse hash util
+      if (!filename) filename = `doc_${Date.now()}_${docs.length}.${ext}`;
+      docs.push({ buffer: buf, mimetype, filename, hash });
+    }
+  }
+  return docs;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -631,7 +715,7 @@ function extractText(content) {
   return String(content || "");
 }
 
-function buildKimiBlocks(messages, tools = [], toolChoice = "auto", imageFileIds = []) {
+function buildKimiBlocks(messages, tools = [], toolChoice = "auto", allFileIds = []) {
   const toolPrompt  = toolsToSystemPrompt(tools, toolChoice);
   const systemLines = [];
   const bodyParts   = [];
@@ -687,14 +771,13 @@ function buildKimiBlocks(messages, tools = [], toolChoice = "auto", imageFileIds
   // Tanpa hint ini, Kimi sebagai agent cenderung memanggil tool vision_analyze
   // (Hermes local cache) yang pasti gagal karena base64 sudah di-strip.
   // Hint ini memberitahu Kimi untuk memakai kemampuan vision natifnya langsung.
-  if (imageFileIds.length > 0) {
-    fullContent += `\n\n[SISTEM: ${imageFileIds.length} gambar dilampirkan langsung dalam percakapan ini sebagai Kimi file block. Kamu BISA melihat dan menganalisis gambar tersebut menggunakan kemampuan vision natifmu — JANGAN memanggil tool vision_analyze atau tool vision eksternal lainnya, karena gambar sudah ada di konteks ini dan bisa kamu lihat langsung.]`;
+  if (allFileIds.length > 0) {
+    fullContent += `\n\n[SISTEM: ${allFileIds.length} file dilampirkan dalam percakapan ini sebagai Kimi file block (gambar dan/atau dokumen). Kamu BISA melihat, membaca, dan menganalisis file tersebut menggunakan kemampuan natifmu — JANGAN memanggil tool vision_analyze, document_analyze, atau tool file eksternal lainnya, karena file sudah ada di konteks ini.]`;
   }
 
-  // Text block + optional file blocks
   const blocks = [
     { message_id: "", text: { content: fullContent.trim() } },
-    ...imageFileIds.map(id => ({ file: { id, status: "PROCESS_STATUS_SUCCESS" } })),
+    ...allFileIds.map(id => ({ file: { id, status: "PROCESS_STATUS_SUCCESS" } })),
   ];
   return blocks;
 }
@@ -1153,7 +1236,6 @@ const server = http.createServer(async (req, res) => {
       const vSlot = alive()[rrIdx % alive().length];
       try {
         for (const img of rawImages) {
-          // Check hash cache first — avoid re-uploading the same image
           const cachedId = _imgCacheGet(img.hash);
           if (cachedId) {
             console.log(`[Vision] Cache hit: ${img.filename} → ${cachedId} (reuse ✓)`);
@@ -1176,37 +1258,78 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    // ── Inject recent file IDs (agent context continuity) ───────────────────
-    // Hermes dan agent framework lain sering strip base64 dari history setelah
-    // beberapa turn untuk hemat token. Kita inject file ID yang diupload dalam
-    // window IMAGE_CACHE_TTL_MS agar Kimi tetap bisa lihat gambar tsb.
+    // ── Inject recent image IDs (agent context continuity) ──────────────────
     {
       const fresh = _recentFileIds().filter(id => !imageFileIds.includes(id));
       if (fresh.length) {
-        console.log(`[Vision] Injecting ${fresh.length} cached file ID(s) from recent uploads: ${fresh.join(", ")}`);
+        console.log(`[Vision] Injecting ${fresh.length} cached image ID(s): ${fresh.join(", ")}`);
         imageFileIds.push(...fresh);
       }
     }
 
-    // ── Suppress vision_analyze saat gambar ada di Kimi file blocks ─────────
-    // vision_analyze (dieksekusi Hermes) cari gambar di LOCAL file cache, bukan
-    // di Kimi file blocks. Kalau gambar sudah ada di file blocks, hapus tool ini
-    // supaya Kimi pakai native vision langsung — bukan relay ke Hermes local cache
-    // yang pasti gagal karena base64 sudah di-strip dari conversation history.
-    let toolsForBlocks = customTools;
-    if (imageFileIds.length > 0) {
-      const VISION_TOOL_NAMES = ["vision_analyze", "image_analyze", "analyze_image", "vision"];
-      const before = customTools.length;
-      toolsForBlocks = customTools.filter(t => {
-        const n = (t.function?.name || t.name || "").toLowerCase();
-        return !VISION_TOOL_NAMES.includes(n);
-      });
-      if (toolsForBlocks.length < before) {
-        console.log(`[Vision] ✓ vision_analyze di-suppress (gambar ada di file block → Kimi pakai native vision)`);
+    // ── Documents: upload PDF / DOCX / XLSX / dll ────────────────────────────
+    // Endpoint sama persis dengan gambar (apiv2-files/file/upload), payload
+    // multipart identik — bedanya hanya MIME type dan previewUrl selalu kosong
+    // sehingga alreadyReady selalu false → selalu poll GetFileParseProgress.
+    let docFileIds = [];
+    const rawDocs = extractDocsFromMessages(messages);
+    if (rawDocs.length) {
+      console.log(`[DocUpload] ${rawDocs.length} dokumen terdeteksi — upload ke Kimi...`);
+      const dSlot = alive()[rrIdx % alive().length];
+      try {
+        for (const doc of rawDocs) {
+          const cachedId = _docCacheGet(doc.hash);
+          if (cachedId) {
+            console.log(`[DocUpload] Cache hit: ${doc.filename} → ${cachedId} (reuse ✓)`);
+            docFileIds.push(cachedId);
+            continue;
+          }
+          // uploadImageToKimi bekerja untuk semua jenis file — endpoint & payload sama
+          const { fileId } = await uploadImageToKimi(dSlot, doc.buffer, doc.filename, doc.mimetype);
+          console.log(`[DocUpload] Uploaded: ${doc.filename} → ${fileId} (polling...)`);
+          // Dokumen tidak punya thumbnail → alreadyReady selalu false, selalu poll
+          const ready = await waitFileReady(dSlot, fileId);
+          if (ready) { docFileIds.push(fileId); _docCacheStore(doc.hash, fileId); }
+          else console.warn(`[DocUpload] File ${fileId} belum ready, skip.`);
+        }
+      } catch (e) {
+        console.warn(`[DocUpload] Upload gagal (lanjut tanpa dokumen): ${e.message}`);
       }
     }
 
-    const blocks = buildKimiBlocks(messages, toolsForBlocks, toolChoice, imageFileIds);
+    // ── Inject recent doc IDs (context continuity untuk multi-turn) ──────────
+    {
+      const freshDocs = _recentDocFileIds().filter(id => !docFileIds.includes(id));
+      if (freshDocs.length) {
+        console.log(`[DocUpload] Injecting ${freshDocs.length} cached doc ID(s): ${freshDocs.join(", ")}`);
+        docFileIds.push(...freshDocs);
+      }
+    }
+
+    // Gabung image + doc IDs → dikirim bareng ke Kimi sebagai file blocks
+    const allFileIds = [...imageFileIds, ...docFileIds];
+
+    // ── Suppress file-analysis tools saat file ada di Kimi blocks ────────────
+    // Tool seperti vision_analyze / document_analyze dieksekusi Hermes secara
+    // lokal, bukan oleh Kimi. Kalau file sudah ada di blocks, suppress tools ini
+    // supaya Kimi pakai kemampuan native-nya langsung.
+    let toolsForBlocks = customTools;
+    if (allFileIds.length > 0) {
+      const FILE_TOOL_NAMES = [
+        "vision_analyze", "image_analyze", "analyze_image", "vision",
+        "document_analyze", "pdf_analyze", "file_analyze", "read_file",
+      ];
+      const before = customTools.length;
+      toolsForBlocks = customTools.filter(t => {
+        const n = (t.function?.name || t.name || "").toLowerCase();
+        return !FILE_TOOL_NAMES.includes(n);
+      });
+      if (toolsForBlocks.length < before) {
+        console.log(`[FileBlock] ✓ file-analysis tools di-suppress (${allFileIds.length} file di block → Kimi pakai native)`);
+      }
+    }
+
+    const blocks = buildKimiBlocks(messages, toolsForBlocks, toolChoice, allFileIds);
     const slot   = nextSlot();
     const id     = `chatcmpl-${uuid()}`;
     const isStreaming = parsed.stream === true;
