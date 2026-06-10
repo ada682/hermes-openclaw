@@ -20,10 +20,12 @@ const warn = m => console.log(`${C.yellow}!${C.reset} ${m}`);
 const err  = m => console.log(`${C.red}✗${C.reset} ${m}`);
 const step = m => console.log(`\n${C.bold}${C.white}${m}${C.reset}`);
 
-const MARKER         = path.join(__dirname, ".setup-done");
-const ENV_FILE       = path.join(__dirname, ".env.qwen");
+const MARKER          = path.join(__dirname, ".setup-done");
+const ENV_FILE        = path.join(__dirname, ".env.qwen");
 // File kecil untuk menyimpan proxy type terakhir yang dipakai
 const PROXY_TYPE_FILE = path.join(__dirname, ".proxy-type");
+// File untuk menyimpan agent type (hermes/openclaw)
+const AGENT_TYPE_FILE = path.join(__dirname, ".agent-type");
 
 // Hermes config paths (Windows: %LOCALAPPDATA%\hermes, Unix: ~/.hermes)
 const HERMES_HOME = process.env.LOCALAPPDATA
@@ -43,8 +45,20 @@ const SOUL_MD       = path.join(__dirname, "soul.md");
 // Env file untuk Kimi tokens
 const ENV_FILE_KIMI = path.join(__dirname, ".env.kimi");
 
-// Agent yang dipakai: "hermes" | "openclaw"
-const AGENT = process.env.AGENT || "hermes";
+// Agent yang dipakai: env AGENT > .agent-type > default "hermes"
+function resolveAgent() {
+  if (process.env.AGENT) return process.env.AGENT.toLowerCase();
+  if (fs.existsSync(AGENT_TYPE_FILE)) {
+    const saved = fs.readFileSync(AGENT_TYPE_FILE, "utf8").trim();
+    if (saved === "hermes" || saved === "openclaw") return saved;
+  }
+  return "hermes";
+}
+function saveAgentType(type) {
+  fs.writeFileSync(AGENT_TYPE_FILE, type.toLowerCase());
+}
+
+const AGENT = resolveAgent();
 
 function ask(rl, q) { return new Promise(r => rl.question(q, r)); }
 
@@ -122,34 +136,85 @@ function patchConfigHermes(tgToken) {
   fs.writeFileSync(HERMES_ENV, envContent);
 }
 
-function patchConfigClaw(tgToken) {
+function patchConfigClaw(tgToken, proxyType = "qwen") {
   // Baca config yang sudah ada (hasil onboard), tambahkan/fix fields yang diperlukan
   let config = {};
   if (fs.existsSync(CLAW_CFG)) {
     try { config = JSON.parse(fs.readFileSync(CLAW_CFG, "utf8")); } catch {}
   }
 
-  if (!config.gateway) config.gateway = {};
-  if (!config.gateway.mode) config.gateway.mode = "local";
+  const isKimi    = proxyType === "kimi";
+  const baseUrl   = isKimi ? "http://localhost:4892/v1" : "http://localhost:4891/v1";
+  const modelId   = isKimi
+    ? (process.env.KIMI_MODEL || "kimi-k2.6")
+    : (process.env.QWEN_MODEL  || "qwen3.7-max");
+  const provName  = isKimi ? "kimi-proxy" : "qwen-proxy";
 
+  // ── 1. gateway mode ──────────────────────────────────────────────────────
+  if (!config.gateway) config.gateway = {};
+  config.gateway.mode = "local";
+
+  // ── 2. Telegram channel ──────────────────────────────────────────────────
   if (!config.channels) config.channels = {};
   config.channels.telegram = {
-    enabled: true,
-    botToken: tgToken,
-    dmPolicy: "pairing",
+    enabled:   true,
+    botToken:  tgToken,
+    dmPolicy:  "pairing",
   };
 
-  if (config.models && !Array.isArray(config.models)) {
-    delete config.models;
-  }
+  // ── 3. Model catalog (models.providers) ─────────────────────────────────
+  // OpenClaw pakai models.providers.<id>.{baseUrl, apiKey, api, models[]}
+  // ref: https://docs.openclaw.ai/gateway/config-tools#custom-providers-and-base-urls
+  if (!config.models || Array.isArray(config.models)) config.models = {};
+  if (!config.models.providers) config.models.providers = {};
+
+  // Hapus entry proxy lama (qwen-proxy/kimi-proxy) supaya tidak duplikat
+  delete config.models.providers["qwen-proxy"];
+  delete config.models.providers["kimi-proxy"];
+
+  config.models.providers[provName] = {
+    baseUrl: baseUrl,
+    apiKey:  "proxy-key",
+    api:     "openai-completions",
+    models:  [
+      {
+        id:            modelId,
+        name:          isKimi ? "Kimi K2.6" : "Qwen 3.7 Max",
+        reasoning:     false,
+        input:         ["text"],
+        cost:          { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 131072,
+        contextTokens: 98304,
+        maxTokens:     32768,
+      },
+    ],
+  };
+
+  // ── 4. Default agent model ───────────────────────────────────────────────
+  if (!config.agents) config.agents = {};
+  if (!config.agents.defaults) config.agents.defaults = {};
+  config.agents.defaults.model = {
+    primary:   `${provName}/${modelId}`,
+  };
+
+  // ── 5. Web search tools ──────────────────────────────────────────────────
+  // Qwen proxy sekarang support auto_search native (auto-detect tool web_search),
+  // jadi tools.profile "coding" (sudah include group:web) sudah cukup.
+  // Tidak perlu external API key untuk kedua backend.
+  if (!config.tools) config.tools = {};
+  config.tools.profile = "coding";
+
+  // ── 6. Soul.md sebagai system prompt (opsional, lewat agents.defaults) ───
+  // Diinject terpisah via patchClawSoulMd() setelah file ini selesai ditulis.
 
   if (!fs.existsSync(CLAW_DIR)) fs.mkdirSync(CLAW_DIR, { recursive: true });
   fs.writeFileSync(CLAW_CFG, JSON.stringify(config, null, 2));
+  ok(`openclaw.json diperbarui (${proxyType} mode) → ${CLAW_CFG}`);
 }
 
-function patchConfig(tgToken) {
+function patchConfig(tgToken, proxyType = "qwen") {
   if (AGENT === "hermes") patchConfigHermes(tgToken);
-  else patchConfigClaw(tgToken);
+  else patchConfigClaw(tgToken, proxyType);
 }
 
 // ─── PYTHON DETECTOR ──────────────────────────────────────────────────────────
@@ -502,14 +567,83 @@ print("OK")
   }
 }
 
-// ─── ORCHESTRATOR: TANYA DULU SEBELUM PATCH ──────────────────────────────────
+// ─── OPENCLAW CONFIG PATCHER ──────────────────────────────────────────────────
 /**
- * Tanya user apakah mau patch config.yaml & .env.
- * Jika NO → tampilkan pesan suruh lihat README.md manual.
- * Jika YES → jalankan semua patch + soul.md.
- * Untuk Qwen: tampilkan info Tavily setelah patch.
+ * Patch openclaw.json untuk proxy type yang aktif (qwen/kimi).
+ * Dipanggil setiap kali startGateway/runAll dengan AGENT=openclaw.
+ * Hanya update fields yang relevan: model, provider, tools profile.
+ * Channel telegram + gateway.mode tidak disentuh kalau sudah ada.
  */
-async function maybePatchHermes(proxyType = "qwen") {
+function patchClawConfig(proxyType = "qwen") {
+  if (AGENT !== "openclaw") return;
+  if (!fs.existsSync(CLAW_CFG)) {
+    warn("openclaw.json belum ada — jalankan setup dulu: node start.js");
+    return;
+  }
+
+  let config = {};
+  try { config = JSON.parse(fs.readFileSync(CLAW_CFG, "utf8")); } catch {
+    warn("Gagal baca openclaw.json, skip patch");
+    return;
+  }
+
+  const isKimi  = proxyType === "kimi";
+  const baseUrl = isKimi ? "http://localhost:4892/v1" : "http://localhost:4891/v1";
+  const modelId = isKimi
+    ? (process.env.KIMI_MODEL || "kimi-k2.6")
+    : (process.env.QWEN_MODEL  || "qwen3.7-max");
+  const provName = isKimi ? "kimi-proxy" : "qwen-proxy";
+
+  // Update model provider
+  if (!config.models || Array.isArray(config.models)) config.models = {};
+  if (!config.models.providers) config.models.providers = {};
+  delete config.models.providers["qwen-proxy"];
+  delete config.models.providers["kimi-proxy"];
+  config.models.providers[provName] = {
+    baseUrl: baseUrl,
+    apiKey:  "proxy-key",
+    api:     "openai-completions",
+    models:  [{
+      id:            modelId,
+      name:          isKimi ? "Kimi K2.6" : "Qwen 3.7 Max",
+      reasoning:     false,
+      input:         ["text"],
+      cost:          { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 131072,
+      contextTokens: 98304,
+      maxTokens:     32768,
+    }],
+  };
+
+  // Update default model
+  if (!config.agents) config.agents = {};
+  if (!config.agents.defaults) config.agents.defaults = {};
+  config.agents.defaults.model = { primary: `${provName}/${modelId}` };
+
+  // Tools profile
+  if (!config.tools) config.tools = {};
+  config.tools.profile = "coding";
+
+  try {
+    fs.writeFileSync(CLAW_CFG, JSON.stringify(config, null, 2));
+    ok(`openclaw.json → ${proxyType} mode (model=${modelId})`);
+  } catch (e) {
+    warn(`Gagal tulis openclaw.json: ${e.message}`);
+  }
+}
+/**
+ * Tanya user apakah mau patch config & env sesuai agent aktif.
+ * Hermes  → patch config.yaml + .env
+ * OpenClaw → patch openclaw.json
+ */
+async function maybePatchConfig(proxyType = "qwen") {
+  if (AGENT === "openclaw") {
+    // OpenClaw: langsung patch tanpa tanya (non-destructive, hanya update model/provider)
+    patchClawConfig(proxyType);
+    return;
+  }
+
+  // ── Hermes path ────────────────────────────────────────────────────────────
   if (AGENT !== "hermes") return;
 
   const isKimi   = proxyType === "kimi";
@@ -595,34 +729,6 @@ ${!isKimi ? `    TAVILY_API_KEY=tvly-xxxx...   ← ambil di https://app.tavily.c
   Setelah edit manual, jalankan lagi: ${C.cyan}node start.js ${isKimi ? "proxy kimi" : "proxy"}${C.reset}
 `);
     return;
-  }
-
-  // ── Backup file asli sebelum patch ────────────────────────────────────────
-  const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  const backupTargets = [
-    [HERMES_CFG, "config.yaml"],
-    [HERMES_ENV, ".env"],
-  ];
-
-  let anyBackedUp = false;
-  for (const [src, label] of backupTargets) {
-    if (fs.existsSync(src)) {
-      const bak = `${src}.backup-${ts}`;
-      try {
-        fs.copyFileSync(src, bak);
-        ok(`Backup: ${label} → ${path.basename(bak)}`);
-        anyBackedUp = true;
-      } catch (e) {
-        warn(`Gagal backup ${label}: ${e.message} — lanjut tanpa backup`);
-      }
-    } else {
-      info(`${label} belum ada, tidak perlu backup`);
-    }
-  }
-
-  if (anyBackedUp) {
-    info(`Backup tersimpan di: ${HERMES_HOME}`);
-    info(`Untuk restore manual: salin file .backup-${ts} kembali ke nama aslinya`);
   }
 
   // ── Lakukan patch ──────────────────────────────────────────────────────────
@@ -805,16 +911,16 @@ ${C.reset}`);
     ok(`Config diperbarui → ${HERMES_HOME}`);
 
   } else {
-    // --- OpenClaw onboard flow (tidak berubah) ---
+    // --- OpenClaw onboard flow ---
     console.log(`${C.yellow}
   Sekarang openclaw akan tanya beberapa hal.
   Ikuti langkah berikut:
   
-  ❶  Pilih provider → cari "Qwen" atau "Model Studio"
-  ❷  Pilih metode auth → "API Key"  
-  ❸  Masukkan API Key → ketik: proxy-key  (bebas, proxy yang manage token asli)
-  ❹  Masukkan Base URL → ketik: http://localhost:4891/v1
-  ❺  Sisanya ikuti default saja (Enter terus)
+  ❶  Pilih "Start without a provider" atau skip provider setup
+     (kita akan patch manual setelah onboard selesai)
+  ❷  Sisanya ikuti default saja (Enter terus)
+
+  ${C.gray}Catatan: provider model akan dipatch otomatis setelah onboard selesai.${C.reset}
 ${C.reset}`);
 
     if (!fs.existsSync(CLAW_DIR)) fs.mkdirSync(CLAW_DIR, { recursive: true });
@@ -846,12 +952,13 @@ ${C.reset}`);
       warn("Onboard keluar dengan kode " + onboard.status + ". Mencoba lanjut...");
     }
 
-    patchConfig(tgToken);
+    patchConfig(tgToken, "qwen");
     ok(`Config diperbarui → ${CLAW_CFG}`);
   }
 
   fs.writeFileSync(MARKER, new Date().toISOString());
-  console.log(`\n${C.green}${C.bold}Setup selesai!${C.reset}\n`);
+  saveAgentType(AGENT);
+  console.log(`\n${C.green}${C.bold}Setup selesai!${C.reset} (agent: ${AGENT})\n`);
 }
 
 // ─── RUN HELPERS ─────────────────────────────────────────────────────────────
@@ -872,6 +979,9 @@ function ensureConfig(proxyType = "qwen") {
       process.env.OPENAI_API_KEY = "proxy-key";
     }
   } else {
+    // OpenClaw: set base URL env supaya openclaw gateway tahu ke mana connect
+    process.env.OPENAI_BASE_URL = isKimi ? "http://localhost:4892/v1" : "http://localhost:4891/v1";
+    process.env.OPENAI_API_KEY  = "proxy-key";
     if (fs.existsSync(CLAW_CFG)) {
       try {
         const cfg = JSON.parse(fs.readFileSync(CLAW_CFG, "utf8"));
@@ -944,7 +1054,7 @@ async function startGateway() {
   }
 
   // Patch hermes config.yaml + .env untuk proxy yang aktif
-  await maybePatchHermes(proxyType);
+  await maybePatchConfig(proxyType);
 
   const label = AGENT === "hermes" ? "Hermes" : "OpenClaw";
   info(`Memulai ${agentCmd} gateway...`);
@@ -974,7 +1084,7 @@ async function runAll() {
   }
 
   // Patch hermes config.yaml + .env
-  await maybePatchHermes(proxyType);
+  await maybePatchConfig(proxyType);
 
   const proxyFile = isKimi ? KIMI_PROXY_JS : PROXY_JS;
   const proxyTag  = isKimi ? "KIMI" : "PROXY";
@@ -1022,18 +1132,61 @@ const arg  = process.argv[2];
 const arg2 = process.argv[3];   // sub-arg: "qwen" | "kimi"
 
 if (arg === "--reset") {
-  [MARKER, ENV_FILE, ENV_FILE_KIMI, PROXY_TYPE_FILE].forEach(f => {
+  // Deteksi config mana yang ada
+  const hasHermes = fs.existsSync(HERMES_CFG) || fs.existsSync(HERMES_ENV);
+  const hasClaw   = fs.existsSync(CLAW_CFG);
+
+  // Kalau ada keduanya → tanya user mau reset yang mana
+  // Kalau cuma satu → langsung reset yang ada
+  let resetHermes = false;
+  let resetClaw   = false;
+
+  if (hasHermes && hasClaw) {
+    console.log(`\n${C.bold}Config yang ditemukan:${C.reset}`);
+    if (hasHermes) console.log(`  ${C.cyan}hermes${C.reset}   → ${HERMES_CFG}`);
+    if (hasClaw)   console.log(`  ${C.cyan}openclaw${C.reset} → ${CLAW_CFG}`);
+    console.log();
+
+    const rl3 = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const ans = await new Promise(r => rl3.question(
+      `  Reset mana? [hermes / openclaw / semua / batal]: `, r
+    ));
+    rl3.close();
+    const choice = ans.trim().toLowerCase();
+
+    if (choice === "batal" || !choice) {
+      info("Reset dibatalkan.");
+      process.exit(0);
+    }
+    resetHermes = choice === "hermes" || choice === "semua";
+    resetClaw   = choice === "openclaw" || choice === "semua";
+  } else {
+    resetHermes = hasHermes;
+    resetClaw   = hasClaw;
+    if (!resetHermes && !resetClaw) {
+      info("Tidak ada config yang ditemukan.");
+    }
+  }
+
+  // File lokal selalu dihapus (token, marker, proxy-type, agent-type)
+  [MARKER, ENV_FILE, ENV_FILE_KIMI, PROXY_TYPE_FILE, AGENT_TYPE_FILE].forEach(f => {
     if (fs.existsSync(f)) { fs.unlinkSync(f); info(`Dihapus: ${path.basename(f)}`); }
   });
-  // Hapus config sesuai agent aktif
-  if (AGENT === "hermes") {
+
+  if (resetHermes) {
     [HERMES_CFG, HERMES_ENV].forEach(f => {
       if (fs.existsSync(f)) { fs.unlinkSync(f); info(`Dihapus: ${path.basename(f)}`); }
     });
-  } else {
+  }
+  if (resetClaw) {
     if (fs.existsSync(CLAW_CFG)) { fs.unlinkSync(CLAW_CFG); info("Dihapus: openclaw.json"); }
   }
-  console.log("\nReset selesai. Jalankan: node start.js\n");
+
+  console.log("\nReset selesai.");
+  console.log(`\n${C.bold}Jalankan setup ulang:${C.reset}`);
+  console.log(`  ${C.cyan}node start.js${C.reset}                  → setup dengan Hermes (default)`);
+  console.log(`  ${C.cyan}AGENT=openclaw node start.js${C.reset}   → setup dengan OpenClaw`);
+  console.log();
   process.exit(0);
 }
 
