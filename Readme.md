@@ -14,13 +14,15 @@ agents yang pake qwen / kimi,reverse api tanpa bayar API resmi. unlimited token
 
 ---
 
-## setup pertama kali (kalo belom ada hermes/openclaw)
+## setup pertama kali isi token ke .env.kimi - qwen -deepseek
 
 ```bash
-node start.js
+node start.js proxy kimi
+or
+node start.js proxy qwen
+or
+node start.js proxy deepseek
 ```
-
-ikutin promptnya — masukin token, bot token telegram, selesai.
 
 ---
 
@@ -57,28 +59,16 @@ cara ambil: buka qwen chat → F12 → Application → Local Storage → klik ya
 ## cara jalankan
 
 ```bash
-# 1 terminal
-node start.js
 
 # 2 terminal (disarankan)
 node start.js proxy  # terminal 1
-# atau
+
 node start.js gateway       # terminal 2
 ```
-
-note . setup dulu mau pake qwen atau kimi, caranya
-node start.js proxy qwen
-atau 
-node start.js proxy kimi
-
-dan juga, setup gateway nya mau pake openclaw atau hermes agent, caranya
-node start.js gateway qwen
-atau
-node start.js gateway kimi
-
-
-pilihan proxy tersimpan otomatis, jadi cukup `node start.js proxy kimi` sekali.
-
+CONTEXT
+Kimi K2.6 = 256k
+Qwen3.7-plur/max = 1M
+Deepseek V4 = 1M
 ---
 
 ## web search
