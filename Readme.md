@@ -67,7 +67,7 @@ node start.js gateway       # terminal 2
 ```
 CONTEXT
 Kimi K2.6 = 256k
-Qwen3.7-plur/max = 1M
+Qwen3.7-plus/max = 1M
 Deepseek V4 = 1M
 ---
 
