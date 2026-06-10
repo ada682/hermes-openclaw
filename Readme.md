@@ -61,11 +61,21 @@ cara ambil: buka qwen chat → F12 → Application → Local Storage → klik ya
 node start.js
 
 # 2 terminal (disarankan)
-node start.js proxy kimi    # terminal 1
+node start.js proxy  # terminal 1
 # atau
-node start.js proxy qwen
 node start.js gateway       # terminal 2
 ```
+
+note . setup dulu mau pake qwen atau kimi, caranya
+node start.js proxy qwen
+atau 
+node start.js proxy kimi
+
+dan juga, setup gateway nya mau pake openclaw atau hermes agent, caranya
+node start.js gateway qwen
+atau
+node start.js gateway kimi
+
 
 pilihan proxy tersimpan otomatis, jadi cukup `node start.js proxy kimi` sekali.
 
