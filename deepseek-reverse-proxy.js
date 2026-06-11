@@ -25,6 +25,7 @@
  *   DEEPSEEK_STREAM_TOTAL_TIMEOUT    – ms (default: 300000)
  *   DEEPSEEK_OVERLOADED_RETRY        – max retry attempts (default: 3)
  *   DEEPSEEK_OVERLOADED_DELAY        – base delay ms per retry (default: 3000)
+ *   DEEPSEEK_SESSION_CLEANUP_THRESHOLD – hapus semua sesi setelah N sesi dibuat per slot (default: 10)
  */
 
 import http   from "http";
@@ -44,7 +45,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT          = parseInt(process.env.DEEPSEEK_PROXY_PORT  || "4893", 10);
 const DEFAULT_MODEL = process.env.DEEPSEEK_MODEL                || "deepseek-chat";
 const SHOW_THINKING = process.env.DEEPSEEK_SHOW_THINKING       === "true";
-const WASM_FILENAME = "sha3.wasm";
+const WASM_FILENAME = "sha3wasm";
 const WASM_PATH     = process.env.DEEPSEEK_WASM_PATH            || path.join(__dirname, WASM_FILENAME);
 
 const STREAM_IDLE_TIMEOUT_MS  = parseInt(process.env.DEEPSEEK_STREAM_IDLE_TIMEOUT  || "90000",  10);
@@ -53,6 +54,7 @@ const IMAGE_CACHE_TTL_MS      = parseInt(process.env.DEEPSEEK_IMAGE_CACHE_TTL   
 const DOC_CACHE_TTL_MS        = parseInt(process.env.DEEPSEEK_DOC_CACHE_TTL        || String(30 * 60 * 1000), 10);
 const OVERLOADED_RETRY_MAX    = parseInt(process.env.DEEPSEEK_OVERLOADED_RETRY     || "3",    10);
 const OVERLOADED_RETRY_DELAY  = parseInt(process.env.DEEPSEEK_OVERLOADED_DELAY     || "3000", 10);
+const SESSION_CLEANUP_THRESHOLD = parseInt(process.env.DEEPSEEK_SESSION_CLEANUP_THRESHOLD || "10",   10);
 
 const BASE = "https://chat.deepseek.com";
 
@@ -314,6 +316,7 @@ class TokenSlot {
     this.accessExpiry = 0;
     this.sessionId    = null;
     this.sessionAt    = 0;
+    this.sessionCreateCount = 0;  // jumlah sesi yang pernah dibuat oleh slot ini
     this._refreshing  = false;
     this._waiters     = [];
   }
@@ -376,6 +379,19 @@ class TokenSlot {
   async getSession() {
     if (this.sessionId && Date.now() - this.sessionAt < 300_000)
       return this.sessionId;
+
+    // ── Auto-cleanup: hapus semua sesi ketika threshold tercapai ────────────────
+    if (this.sessionCreateCount > 0 && this.sessionCreateCount % SESSION_CLEANUP_THRESHOLD === 0) {
+      console.log(`[DeepSeekProxy] slot ${this.slot} — sesi ke-${this.sessionCreateCount}, trigger delete_all (threshold=${SESSION_CLEANUP_THRESHOLD})`);
+      try {
+        await this.deleteAllSessions();
+      } catch (e) {
+        console.warn(`[DeepSeekProxy] slot ${this.slot} — delete_all gagal (lanjut): ${e.message}`);
+      }
+      // Reset sessionId supaya dibuat fresh setelah cleanup
+      this.sessionId = null;
+    }
+
     const tok  = await this.getAccessToken();
     const body = Buffer.from(JSON.stringify({ character_id: null }));
     return new Promise((resolve, reject) => {
@@ -401,12 +417,50 @@ class TokenSlot {
             if (!sid) return reject(new Error("No session id in create response"));
             this.sessionId = sid;
             this.sessionAt = Date.now();
+            this.sessionCreateCount++;
+            console.log(`[DeepSeekProxy] slot ${this.slot} — sesi baru #${this.sessionCreateCount}: ${sid}`);
             resolve(sid);
           } catch (e) { reject(new Error(`Session create parse: ${e.message}`)); }
         }).catch(reject);
       });
       req.on("error", reject);
       req.write(body);
+      req.end();
+    });
+  }
+
+  /** Hapus semua sesi akun ini via DELETE /api/v0/chat_session/delete_all */
+  deleteAllSessions() {
+    return new Promise(async (resolve, reject) => {
+      let tok;
+      try { tok = await this.getAccessToken(); }
+      catch (e) { return reject(new Error(`deleteAllSessions: gagal ambil token — ${e.message}`)); }
+
+      const req = https.request({
+        hostname: "chat.deepseek.com",
+        path:     "/api/v0/chat_session/delete_all",
+        method:   "POST",
+        headers:  this.baseHeaders({
+          "Authorization":   `Bearer ${tok}`,
+          "Content-Length":  "0",
+          "Accept":          "application/json",
+          "Accept-Encoding": "identity",
+        }),
+        agent: AGENT,
+      }, res => {
+        collectBody(res).then(buf => {
+          try {
+            const d    = JSON.parse(buf.toString("utf8"));
+            const code = d?.code ?? d?.data?.biz_code ?? -1;
+            if (res.statusCode !== 200 || code !== 0) {
+              return reject(new Error(`delete_all HTTP ${res.statusCode} code=${code}: ${buf.toString("utf8",0,200)}`));
+            }
+            console.log(`[DeepSeekProxy] slot ${this.slot} — delete_all OK ✓ (semua sesi terhapus)`);
+            resolve();
+          } catch (e) { reject(new Error(`delete_all parse: ${e.message}`)); }
+        }).catch(reject);
+      });
+      req.on("error", reject);
       req.end();
     });
   }
@@ -455,7 +509,7 @@ if (!POOL.length) {
   console.error("[DeepSeekProxy] ERROR: Tidak ada token! Set DEEPSEEK_TOKEN_1 dulu.");
   process.exit(1);
 }
-console.log(`[DeepSeekProxy] ${POOL.length} token dimuat | port=${PORT} | model=${DEFAULT_MODEL} | showThinking=${SHOW_THINKING} | imgCache=${IMAGE_CACHE_TTL_MS/60000}m | docCache=${DOC_CACHE_TTL_MS/60000}m | retry=${OVERLOADED_RETRY_MAX}x${OVERLOADED_RETRY_DELAY}ms`);
+console.log(`[DeepSeekProxy] ${POOL.length} token dimuat | port=${PORT} | model=${DEFAULT_MODEL} | showThinking=${SHOW_THINKING} | imgCache=${IMAGE_CACHE_TTL_MS/60000}m | docCache=${DOC_CACHE_TTL_MS/60000}m | retry=${OVERLOADED_RETRY_MAX}x${OVERLOADED_RETRY_DELAY}ms | sessionCleanup=setiap ${SESSION_CLEANUP_THRESHOLD} sesi`);
 
 let rrIdx = 0;
 function alive() {
@@ -933,6 +987,7 @@ function streamDeepSeek(slot, chatPayload, res, id, modelId, activeTools) {
         if (resolved) return;
         _clearTimers();
         resolved = true;
+
         if (activeTools && hasToolUse(answerBuf)) {
           const emitted = emitToolCalls(res, id, modelId, answerBuf);
           finishReasonSent = true;
@@ -962,6 +1017,7 @@ function streamDeepSeek(slot, chatPayload, res, id, modelId, activeTools) {
 
       function processLine(line) {
         if (!line.startsWith("data:")) return;
+
         const data = line.slice(5).trim();
         if (data === "[DONE]") { done(); return; }
 
@@ -994,7 +1050,7 @@ function streamDeepSeek(slot, chatPayload, res, id, modelId, activeTools) {
           return; // skip search results
         } else if (typeof chunk.v === "string") {
           const c = chunk.v.replace(/FINISHED/g, "");
-          if (c) frags.push({ type: currentType || "ANSWER", content: c });
+          if (c) frags.push({ type: currentType === "thinking" ? "THINK" : "ANSWER", content: c });
         }
 
         for (const { type, content } of frags) {
