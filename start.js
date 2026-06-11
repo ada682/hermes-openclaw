@@ -489,6 +489,9 @@ function patchHermesConfig(proxyType = "qwen") {
   const tmpPy = path.join(os.tmpdir(), "hermes_patch_proxy_cfg.py");
   fs.writeFileSync(tmpPy, `
 import yaml
+import re
+import sys
+import json
 
 config_path    = r"${cfgPathEsc}"
 proxy_type     = "${proxyType}"
@@ -496,10 +499,156 @@ kimi_model     = "${kimiModel}"
 qwen_model     = "${qwenModel}"
 deepseek_model = "${deepseekModel}"
 
+# === STEP 1: Read raw text ===
 with open(config_path, encoding="utf-8") as f:
-    cfg = yaml.safe_load(f) or {}
+    raw_text = f.read()
 
-# ── Pilih nilai berdasarkan proxy_type ───────────────────────────────────────
+# === STEP 2: Text-based YAML repair ===
+def repair_yaml_text(text):
+    # Fix A: scalar value placed on next line with wrong indentation
+    # Example: "  show_reasoning:\nfalse"  ->  "  show_reasoning: false"
+    lines = text.split("\n")
+    result = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if (stripped and stripped.endswith(":") and
+                not stripped.startswith("#") and
+                not stripped.startswith("-") and
+                i + 1 < len(lines)):
+            nxt   = lines[i + 1]
+            nxt_s = nxt.strip()
+            cur_indent = len(line) - len(line.lstrip())
+            nxt_indent = len(nxt) - len(nxt.lstrip()) if nxt_s else 9999
+            if (nxt_s and
+                    ":" not in nxt_s and
+                    not nxt_s.startswith("-") and
+                    not nxt_s.startswith("#") and
+                    nxt_indent <= cur_indent):
+                result.append(line.rstrip() + " " + nxt_s)
+                i += 2
+                continue
+        result.append(line)
+        i += 1
+    text = "\n".join(result)
+
+    # Fix B: fallback_providers as JSON string -> proper YAML
+    # Example: fallback_providers: '["custom"]'  ->  fallback_providers: ["custom"]
+    def _fix_fp(m):
+        raw_val = m.group(2).strip("'\"")
+        try:
+            parsed = json.loads(raw_val)
+            if isinstance(parsed, list) and parsed:
+                items_str = ", ".join(json.dumps(p) for p in parsed)
+                return m.group(1) + ": [" + items_str + "]"
+        except Exception:
+            pass
+        return m.group(1) + ": []"
+    text = re.sub(
+        r"^(fallback_providers):\s*(['\"][^\n]+['\"])$",
+        _fix_fp, text, flags=re.MULTILINE
+    )
+
+    # Fix C: remove misplaced root-level keys (indentation slippage)
+    # singularity_image and allowed_rooms belong inside terminal/matrix
+    text = re.sub(r"^singularity_image:[^\n]*\n", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^allowed_rooms:[^\n]*\n",     "", text, flags=re.MULTILINE)
+
+    return text
+
+# === STEP 3: Parse with repair fallback ===
+cfg = None
+repairs_done = []
+
+# Attempt 1: direct parse
+try:
+    cfg = yaml.safe_load(raw_text) or {}
+except yaml.YAMLError:
+    repairs_done.append("YAML syntax error - applying text repair")
+
+    # Attempt 2: after text repair
+    try:
+        repaired_text = repair_yaml_text(raw_text)
+        cfg = yaml.safe_load(repaired_text) or {}
+        repairs_done.append("text repair succeeded")
+    except yaml.YAMLError as e2:
+        repairs_done.append("rebuilding from salvaged sections")
+        cfg = {}
+
+        # Salvage critical sections via targeted mini-parse
+        salvage_keys = ["telegram", "discord", "slack",
+                        "custom_providers", "model", "agent", "plugins"]
+        for key in salvage_keys:
+            pat = r"^" + re.escape(key) + r":\s*\n((?:  [^\n]*\n?)*)"
+            match = re.search(pat, raw_text, re.MULTILINE)
+            if match:
+                try:
+                    partial = yaml.safe_load(match.group(0))
+                    if partial and isinstance(partial, dict):
+                        cfg[key] = partial.get(key)
+                except Exception:
+                    pass
+
+if repairs_done:
+    print("AUTO-REPAIR: " + " | ".join(repairs_done), file=sys.stderr)
+
+# === STEP 4: Field-level validation & structural fixes ===
+
+# 4a. fallback_providers must be a list, not a string
+fp = cfg.get("fallback_providers")
+if isinstance(fp, str):
+    try:
+        parsed = json.loads(fp)
+        cfg["fallback_providers"] = parsed if isinstance(parsed, list) else []
+    except Exception:
+        cfg["fallback_providers"] = []
+elif fp is None:
+    cfg["fallback_providers"] = []
+
+# 4b. terminal must be a dict; sub-keys belong INSIDE it (not at root)
+terminal = cfg.get("terminal")
+if not isinstance(terminal, dict):
+    terminal = {}
+if "singularity_image" not in terminal:
+    terminal["singularity_image"] = "docker://nikolaik/python-nodejs:python3.11-nodejs20"
+if "modal_image" not in terminal:
+    terminal["modal_image"] = "nikolaik/python-nodejs:python3.11-nodejs20"
+cfg["terminal"] = terminal
+
+# 4c. display.show_reasoning must be bool (False by default)
+display = cfg.get("display")
+if isinstance(display, dict):
+    sr = display.get("show_reasoning")
+    if not isinstance(sr, bool):
+        display["show_reasoning"] = False
+    cfg["display"] = display
+
+# 4d. matrix.allowed_rooms belongs inside matrix, not at root
+matrix = cfg.get("matrix")
+if isinstance(matrix, dict) and "allowed_rooms" not in matrix:
+    matrix["allowed_rooms"] = ""
+    cfg["matrix"] = matrix
+
+# 4e. model: remove stray max_tokens (breaks some providers)
+model_sec = cfg.get("model")
+if isinstance(model_sec, dict):
+    model_sec.pop("max_tokens", None)
+    cfg["model"] = model_sec
+
+# 4f. providers dict: ensure all entries are dicts, not strings
+providers_dict = cfg.get("providers")
+if isinstance(providers_dict, dict):
+    cfg["providers"] = {k: v for k, v in providers_dict.items()
+                        if isinstance(v, dict)}
+
+# 4g. Bump _config_version if outdated (v27 -> v28)
+ver = cfg.get("_config_version", 0)
+if isinstance(ver, int) and ver < 28:
+    cfg["_config_version"] = 28
+    repairs_done.append("_config_version bumped to 28")
+
+# === STEP 5: Apply proxy patches ===
 if proxy_type == "kimi":
     default_model  = kimi_model
     base_url       = "http://localhost:4892/v1"
@@ -510,38 +659,40 @@ elif proxy_type == "deepseek":
     base_url       = "http://localhost:4893/v1"
     provider_name  = "deepseek proxy"
     provider_model = deepseek_model
-else:  # qwen
+else:
     default_model  = qwen_model
     base_url       = "http://localhost:4891/v1"
     provider_name  = "qwen proxy"
     provider_model = "qwen3.7-plus"
 
-# ── 1. model section ────────────────────────────────────────────────────────
-if "model" not in cfg:
+# 5a. model section
+if "model" not in cfg or not isinstance(cfg["model"], dict):
     cfg["model"] = {}
-
 cfg["model"]["default"]  = default_model
 cfg["model"]["base_url"] = base_url
 cfg["model"]["provider"] = "custom"
 cfg["model"]["api_key"]  = "proxy-key"
 cfg["model"]["api_mode"] = "chat_completions"
 
-# ── 2. custom_providers ─────────────────────────────────────────────────────
-providers = cfg.get("custom_providers") or []
-# Hapus entry lama semua proxy
-providers = [p for p in providers if isinstance(p, dict)
-             and p.get("name") not in ("qwen proxy", "kimi proxy", "deepseek proxy")]
-
-providers.insert(0, {
-    "name":     provider_name,
-    "base_url": base_url,
-    "api_key":  "proxy-key",
-    "model":    provider_model,
-    "api_mode": "chat_completions",
+# 5b. custom_providers: replace only the proxy entry, keep user's others
+# (preserves extras like "General Computer", personal APIs, etc.)
+cust = cfg.get("custom_providers") or []
+if not isinstance(cust, list):
+    cust = []
+proxy_names = {"qwen proxy", "kimi proxy", "deepseek proxy"}
+cust = [p for p in cust if isinstance(p, dict) and p.get("name") not in proxy_names]
+cust.insert(0, {
+    "name":                  provider_name,
+    "base_url":              base_url,
+    "api_key":               "proxy-key",
+    "model":                 provider_model,
+    "api_mode":              "chat_completions",
+    "context_length":        1000000,
+    "stale_timeout_seconds": 600,
 })
-cfg["custom_providers"] = providers
+cfg["custom_providers"] = cust
 
-# ── 3. plugins + image_gen ──────────────────────────────────────────────────
+# 5c. plugins + image_gen
 plugins = cfg.get("plugins") or {}
 if not isinstance(plugins, dict):
     plugins = {}
@@ -550,11 +701,9 @@ if not isinstance(enabled, list):
     enabled = []
 
 if proxy_type in ("kimi", "deepseek"):
-    # Kimi & DeepSeek tidak support image gen — nonaktifkan plugin
     enabled = [p for p in enabled if p != "image_gen/qwen-proxy"]
     cfg["image_gen"] = {"provider": "none", "use_gateway": False, "model": ""}
 else:
-    # Qwen — aktifkan kembali image gen
     if "image_gen/qwen-proxy" not in enabled:
         enabled.append("image_gen/qwen-proxy")
     cfg["image_gen"] = {"provider": "qwen-proxy", "use_gateway": False, "model": "qwen-image"}
@@ -562,20 +711,20 @@ else:
 plugins["enabled"] = enabled
 cfg["plugins"] = plugins
 
-# ── 4. auxiliary.vision ─────────────────────────────────────────────────────
-if "auxiliary" not in cfg:
+# 5d. auxiliary.vision
+if "auxiliary" not in cfg or not isinstance(cfg.get("auxiliary"), dict):
     cfg["auxiliary"] = {}
-if not isinstance(cfg["auxiliary"], dict):
-    cfg["auxiliary"] = {}
-if "vision" not in cfg["auxiliary"] or not isinstance(cfg["auxiliary"]["vision"], dict):
+vision = cfg["auxiliary"].get("vision")
+if not isinstance(vision, dict):
     cfg["auxiliary"]["vision"] = {}
-
 cfg["auxiliary"]["vision"]["base_url"] = base_url
 cfg["auxiliary"]["vision"]["model"]    = default_model
 cfg["auxiliary"]["vision"]["api_key"]  = "proxy-key"
 
+# === STEP 6: Save ===
 with open(config_path, "w", encoding="utf-8") as f:
-    yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False,
+              sort_keys=False, width=4096)
 
 print("OK")
 `);
