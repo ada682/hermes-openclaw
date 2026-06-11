@@ -26,6 +26,32 @@ import https  from "https";
 import zlib   from "zlib";
 import crypto from "crypto";
 import { URL } from "url";
+import fs     from "fs";
+
+// ── Auto-load .env file ───────────────────────────────────────────────────
+// Coba .env.kimi dulu, fallback ke .env biasa.
+// Harus jalan SEBELUM POOL init supaya KIMI_TOKEN_* kebaca.
+(function loadDotEnv() {
+  for (const envFile of [".env.kimi", ".env"]) {
+    try {
+      const lines = fs.readFileSync(envFile, "utf8").split(/\r?\n/);
+      let loaded = 0;
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t || t.startsWith("#")) continue;
+        const eq = t.indexOf("=");
+        if (eq < 1) continue;
+        const key = t.slice(0, eq).trim();
+        const val = t.slice(eq + 1).trim().replace(/^["']|["']$/g, "");
+        if (key && !(key in process.env)) { process.env[key] = val; loaded++; }
+      }
+      if (loaded > 0) {
+        console.log(`[KimiProxy] Loaded ${loaded} var(s) from ${envFile}`);
+        break;
+      }
+    } catch { /* file tidak ada — skip */ }
+  }
+})();
 
 const PORT          = parseInt(process.env.KIMI_PROXY_PORT  || "4892", 10);
 const BASE          = "https://www.kimi.com";
@@ -684,6 +710,7 @@ function parseToolUse(content) {
   const calls = [];
 
   if (content.includes("[function_calls")) {
+    // Primary: [call:name]{...}[/call]
     const re = /\[call:([\w.\-]+)\]([\s\S]*?)\[\/call\]/g;
     let m;
     while ((m = re.exec(content)) !== null) {
@@ -691,6 +718,29 @@ function parseToolUse(content) {
       calls.push({ id: `tool_${calls.length}`, type: "function",
                    function: { name: m[1], arguments: args } });
     }
+
+    // Fallback: legacy [tool_name]\n{...}\n format (no [call:] prefix, no [/call])
+    // Kimi kadang generates [name]{...} style walaupun system prompt sudah benar.
+    if (!calls.length) {
+      const reLegacy = /\[function_calls\]\s*\[([\w.\-]+)\]\s*([\s\S]*?)\s*(?:\[\/function_calls\]|$)/g;
+      let ml;
+      while ((ml = reLegacy.exec(content)) !== null) {
+        const jsonMatch = ml[2].trim().match(/(\{[\s\S]*?\})/);
+        if (jsonMatch) {
+          const args = jsonMatch[1].replace(/\s+/g, " ");
+          calls.push({ id: `tool_${calls.length}`, type: "function",
+                       function: { name: ml[1], arguments: args } });
+        }
+      }
+    }
+
+    // Validasi: drop call yang argumennya bukan valid JSON
+    const valid = calls.filter(c => {
+      try { JSON.parse(c.function.arguments); return true; } catch { return false; }
+    });
+    if (valid.length !== calls.length)
+      console.warn(`[KimiProxy] ⚠ parseToolUse: dropped ${calls.length - valid.length} call(s) with invalid JSON args`);
+    if (valid.length) return valid;
   }
 
   if (content.includes("<tool_use>")) {
