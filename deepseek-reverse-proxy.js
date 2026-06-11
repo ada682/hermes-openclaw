@@ -9,7 +9,7 @@
  *  • Web search: native search_enabled flag (x-deepseek-search header)
  *  • Thinking mode: deepseek-reasoner / -thinking / -think suffix
  *  • Vision: upload gambar ke /api/v0/file/upload_file, poll sampai ready
- *  • POW Challenge solver via WASM (sha3_wasm_bg.7b9ca65ddd.wasm)
+ *  • POW Challenge solver via WASM (sha3_wasm.wasm)
  *  • Image + Doc file-ID cache (10/30 menit) — context continuity multi-turn
  *  • Retry otomatis (overloaded/timeout) — rotate slot, SSE keep-alive comment
  *
@@ -18,7 +18,7 @@
  *   DEEPSEEK_PROXY_PORT              – port (default: 4893)
  *   DEEPSEEK_MODEL                   – default model (default: deepseek-chat)
  *   DEEPSEEK_SHOW_THINKING           – emit reasoning_content delta (default: false)
- *   DEEPSEEK_WASM_PATH               – path ke .wasm (default: ./sha3_wasm_bg.7b9ca65ddd.wasm)
+ *   DEEPSEEK_WASM_PATH               – path ke .wasm (default: ./sha3_wasm.wasm)
  *   DEEPSEEK_IMAGE_CACHE_TTL         – ms (default: 600000 = 10 menit)
  *   DEEPSEEK_DOC_CACHE_TTL           – ms (default: 1800000 = 30 menit)
  *   DEEPSEEK_STREAM_IDLE_TIMEOUT     – ms (default: 90000)
@@ -44,7 +44,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT          = parseInt(process.env.DEEPSEEK_PROXY_PORT  || "4893", 10);
 const DEFAULT_MODEL = process.env.DEEPSEEK_MODEL                || "deepseek-chat";
 const SHOW_THINKING = process.env.DEEPSEEK_SHOW_THINKING       === "true";
-const WASM_FILENAME = "sha3_wasm_bg.7b9ca65ddd.wasm";
+const WASM_FILENAME = "sha3_wasm.wasm";
 const WASM_PATH     = process.env.DEEPSEEK_WASM_PATH            || path.join(__dirname, WASM_FILENAME);
 
 const STREAM_IDLE_TIMEOUT_MS  = parseInt(process.env.DEEPSEEK_STREAM_IDLE_TIMEOUT  || "90000",  10);
