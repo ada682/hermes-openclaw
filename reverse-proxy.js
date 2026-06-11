@@ -20,6 +20,33 @@ import http   from "http";
 import https  from "https";
 import crypto from "crypto";
 import { URL } from "url";
+import fs     from "fs";
+
+// ── Auto-load .env file ───────────────────────────────────────────────────
+// Coba .env.qwen dulu (Qwen-specific), fallback ke .env biasa.
+// Jalankan SEBELUM semua konstanta supaya POOL bisa baca token.
+// Key yang sudah ada di process.env (set manual) tidak di-overwrite.
+(function loadDotEnv() {
+  for (const envFile of [".env.qwen", ".env"]) {
+    try {
+      const lines = fs.readFileSync(envFile, "utf8").split(/\r?\n/);
+      let loaded = 0;
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t || t.startsWith("#")) continue;
+        const eq = t.indexOf("=");
+        if (eq < 1) continue;
+        const key = t.slice(0, eq).trim();
+        const val = t.slice(eq + 1).trim().replace(/^["']|["']$/g, ""); // strip quotes
+        if (key && !(key in process.env)) { process.env[key] = val; loaded++; }
+      }
+      if (loaded > 0) {
+        console.log(`[QwenProxy] Loaded ${loaded} var(s) from ${envFile}`);
+        break; // stop at first file yang berhasil dimuat
+      }
+    } catch { /* file tidak ada — skip */ }
+  }
+})();
 
 const PORT          = parseInt(process.env.QWEN_PROXY_PORT   || "4891", 10);
 const BASE          = "https://chat.qwen.ai";
@@ -40,6 +67,9 @@ const STREAM_IDLE_TIMEOUT_MS  = parseInt(process.env.QWEN_STREAM_IDLE_TIMEOUT  |
 const STREAM_TOTAL_TIMEOUT_MS = parseInt(process.env.QWEN_STREAM_TOTAL_TIMEOUT || "300000", 10);
 const RETRY_MAX               = parseInt(process.env.QWEN_RETRY_MAX            || "3",      10);
 const RETRY_DELAY             = parseInt(process.env.QWEN_RETRY_DELAY          || "3000",   10);
+// QWEN_DEBUG=true   — log full outgoing payload + raw SSE lines per request
+// node reverse-proxy.js test [--model X] [--prompt "..."] — standalone test mode
+let DEBUG_MODE = process.env.QWEN_DEBUG === "true" || process.argv.includes("--debug");
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -183,10 +213,10 @@ function makeHeaders(token, chatId) {
     "Accept-Language":     "zh-CN,zh;q=0.9",
     "Content-Type":        "application/json",
     "source":              "web",
-    "User-Agent":          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-    "sec-ch-ua":           '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
+    "User-Agent":          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+    "sec-ch-ua":           '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
     "sec-ch-ua-mobile":    "?0",
-    "sec-ch-ua-platform":  '"macOS"',
+    "sec-ch-ua-platform":  '"Windows"',
     "Sec-Fetch-Dest":      "empty",
     "Sec-Fetch-Mode":      "cors",
     "Sec-Fetch-Site":      "same-origin",
@@ -194,7 +224,7 @@ function makeHeaders(token, chatId) {
     "bx-umidtoken":        "T2gAr9z8byN8sNOmfQ3X9j61MNTNmSqDO5L1rs2jMcQCVhOKgZICcBN-UdTuJGig-NM=",
     "bx-ua":               "231!lWD36kmUe5E+joKDK5gBZ48FEl2ZWfPwIPF92lBLek2KxVW/XJ2EwruCiDOX5Px4EXNhmh6EfS9eDwQGRwijIK64A4nPqeLysJcDjUACje/H3J4ZgGZpicG6K8AkiGGaEKC830+QSiSUsLRlL/EyhXTmLcJc/5iDkMuOpUhNz0e0Q/nTqjVJ3ko00Q/oyE+jauHhUHfb1GxGHkE+++3+qCS4+ItkaA6tiItCo+romzElfLFD6RIj7oHt9vffs98nLwpHnaqKjufnLFMejSlAUGiQvTofIiGhIvftAMcoFV4mrUHsqyQ/ncQihmJHkbxXjvM57FCb6b9dEIRZl7jgj0+QLNLRs0NZ4azdZ6rzbGTSO8KA5I3Aq/3gBr87X16Mj0oJtaPKmFGaP2zghfOVhxQht8YjRd50lJa+Ue4PAuPSdu2O69DKLH8VOhrsB+psaBIRxnRi5POUQ6w8s8qlb9vxvExjHNOAKWXV1by1Nz+6FPWdyTeAgcmonjCcV0dCtPj/KyeVDkeSrDkKZjnDzHEqeCdfmJ65kve+Vy3YS0vagzyHfVEnzN0ULUZtkGfJXFNm6+bIa55wmGBhUeXbHL0EdlQXMu1YXxmcwBgTaq7tlQcfv7AefanbfjGE8R1IFnNyg2/jXLbnLg5Z6l1oKqgnxZQg0DE9BJuw6s0XjGwTdSxybWxp+WFD/RsXt76uwvCBk7z+YmSFLtFj2UlTsoq+vl0DTmsVItDKf9SZ94NcuJ7mxJYI02S/2kQBfbbHG0d4hXevDrEC0cb86EvzN2ud+v6bAunNRGNFz/RH0KLusoBVeo+puCFKeeIJWEo0t1UicX5YxJwMAoV7+g0gK93y4W9sMQtso8/wY5wsBzis9dwfLvIwXpaAM1g0MZp/YIRq8T/Qc+U/8x99tam4er0IWizvrkjqhIzCWBKpJ4Y4gj3bOmiS3VCMEaoVfKCwUWENwYKuP3H5VI0n+O2vVVRrekUrwvkm6URRhVhN4eEFTCjB9nSQu++qKyDH8HPpkS3YfwF8/OQtrZo7hQXxvNmP2HcH/K7zcweD00BaoOLiYUtXRItGYbl06sVSbm04soRf1Jqpyo3XiRqBWD9rmJfr4w8NOEGVGUCKXLDLsXy+8JC4Iqf0FsIjWxjMVdraTUtCbwXRbYUownQVm6bt7LYD1SNPoWNPqUJgsLMwP33ugrb1UbHCs24roOch6Go5QHIPA8E15SZE9pkr1SkmqrNs/+KRomFJ9HyFnWUYhZIV9MRLqlOAt6XBBTash3WJnCjhx/PZGhXVvdn2jX4+0Pm55LsiNugA8vaAUJQBxD/8a1u/RvTgbj35+b7I7m8tG0hMhClNZF+tpsOmZZhUGuXH9uVbkJMlMuAmMVCHwn3O31GlLeXXzzep2WS3xN2U+p5J0I7GySnuZUkuGs1ZTVqGUvR2g4q+7ljU55Ak78yPZiQXeUeqS74azszvZvCqWxXn2eePj+gcpliOjrYKpglUP19rQrMt8PqLt8L0ghIqVCmMwl3Hgr/VUcqDpXdpPTR=",
     "Timezone":            new Date().toString(),
-    "Version":             "0.2.7",
+    "Version":             "0.2.63",
     "Authorization":       `Bearer ${token}`,
     "Origin":              "https://chat.qwen.ai",
     "x-accel-buffering":   "no",
@@ -687,7 +717,7 @@ function streamQwen(token, chatId, prompt, modelId, thinking, useSearch, res, id
       feature_config: {
         thinking_enabled: thinkingEnabled, output_schema: "phase",
         research_mode: "normal", auto_thinking: autoThinking,
-        thinking_mode: thinking, thinking_format: "summary",
+        thinking_mode: thinking,
         auto_search: useSearch,
       },
       extra: { meta: { subChatType: "t2t" } },
@@ -695,6 +725,14 @@ function streamQwen(token, chatId, prompt, modelId, thinking, useSearch, res, id
     }],
     timestamp: ts + 1,
   });
+
+  if (DEBUG_MODE) {
+    console.log(`\n[Debug] ─── Outgoing request ─────────────────────────────────────`);
+    console.log(`[Debug] → POST /api/v2/chat/completions?chat_id=${chatId}`);
+    console.log(`[Debug] → model=${modelId} | thinking=${thinking} | useSearch=${useSearch} | tools=${tools.length}`);
+    console.log(`[Debug] → payload:\n${JSON.stringify(JSON.parse(payload), null, 2)}`);
+    console.log(`[Debug] ────────────────────────────────────────────────────────────\n`);
+  }
 
   return new Promise((resolve, reject) => {
     const u = new URL(`${BASE}/api/v2/chat/completions?chat_id=${chatId}`);
@@ -765,6 +803,7 @@ function streamQwen(token, chatId, prompt, modelId, thinking, useSearch, res, id
           const src = line.startsWith("data: ") ? line.slice(6) : line;
           if (src.trim() === "[DONE]") continue;
 
+          if (DEBUG_MODE) console.log(`[Debug] ← sse: ${src.slice(0, 500)}`);
           try {
             const d = JSON.parse(src);
             if (!d.choices) continue;
@@ -1098,7 +1137,7 @@ const server = http.createServer((req, res) => {
           feature_config: {
             thinking_enabled: false, output_schema: "phase",
             research_mode: "normal", auto_thinking: false,
-            thinking_mode: "Fast", thinking_format: "summary",
+            thinking_mode: "Fast",
             auto_search: false,
           },
           extra: { meta: { subChatType: "t2t" } },
@@ -1411,9 +1450,124 @@ const server = http.createServer((req, res) => {
   });
 });
 
-server.listen(PORT, () => {
-  console.log(`[QwenProxy] ✓ http://127.0.0.1:${PORT}/v1  (${POOL.length} token siap)`);
-  const { modelId: defaultModelId } = mapModel(DEFAULT_MODEL);
-  console.log(`[QwenProxy] Pre-warming ${SESSION_BUFFER} sessions for ${defaultModelId}...`);
-  for (let i = 0; i < SESSION_BUFFER; i++) preWarmSession(defaultModelId);
-});
+// ═══════════════════════════════════════════════════════════════════════════
+// ── Test / debug subcommand ────────────────────────────────────────────────
+//
+//   node reverse-proxy.js test [--model qwen3.7-max] [--prompt "..."] [--search]
+//
+//   Tanpa menjalankan HTTP server: langsung kirim satu request ke Qwen,
+//   tampilkan raw payload + setiap SSE line + parsed phases + timing.
+//   Berguna untuk ngecek apakah token valid, payload benar, dll.
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function runTest() {
+  const args       = process.argv.slice(3);
+  const getArg     = flag => { const i = args.indexOf(flag); return i >= 0 ? args[i + 1] : null; };
+  const modelArg   = getArg("--model")  || DEFAULT_MODEL;
+  const promptArg  = getArg("--prompt") || "hi";
+  const useSearch  = args.includes("--search");
+  const slotArg    = parseInt(getArg("--slot") || "1", 10) - 1; // 0-indexed
+
+  const { modelId, thinkingSuffix } = mapModel(modelArg);
+  const thinking = thinkingSuffix || DEFAULT_THINKING;
+
+  DEBUG_MODE = true; // always verbose in test mode
+
+  console.log(`\n[Test] ════════════════════════════════════════════════════`);
+  console.log(`[Test] model=${modelId} | thinking=${thinking} | search=${useSearch}`);
+  console.log(`[Test] prompt="${promptArg}"`);
+  console.log(`[Test] tokens loaded: ${POOL.length}`);
+
+  const slot = POOL[Math.min(slotArg, POOL.length - 1)];
+  if (!slot) { console.error(`[Test] ✗ Slot tidak ditemukan`); process.exit(1); }
+  console.log(`[Test] Using token slot ${slot.slot} (gunakan --slot N untuk ganti)`);
+
+  process.stdout.write(`[Test] Creating session... `);
+  const t0     = Date.now();
+  const chatId = await createChatRaw(slot.token, modelId);
+  if (!chatId) {
+    console.error(`\n[Test] ✗ Gagal create session — cek token / network`);
+    process.exit(1);
+  }
+  console.log(`✓ chatId=${chatId} (${Date.now() - t0}ms)\n`);
+
+  const id        = `test-${uuid()}`;
+  const rawLines  = [];
+  const phaseBufs = {};  // phase → accumulated text
+  let   usageData = null;
+
+  // fakeRes: intercept SSE writes, collect & print
+  const fakeRes = {
+    write(data) {
+      if (typeof data !== "string") return;
+      if (data.startsWith(":")) {
+        // SSE keep-alive comment (from retry logic) — just print
+        console.log(`  [keepalive] ${data.trim()}`);
+        return;
+      }
+      for (const line of data.split("\n")) {
+        const raw = line.startsWith("data: ") ? line.slice(6).trim() : line.trim();
+        if (!raw) continue;
+        rawLines.push(raw);
+        if (raw === "[DONE]") continue; // already logged by debug mode
+        try {
+          const d     = JSON.parse(raw);
+          const delta = d.choices?.[0]?.delta;
+          if (delta) {
+            const ph = delta.phase || (delta.reasoning_content !== undefined ? "_reasoning" : "_misc");
+            if (!phaseBufs[ph]) phaseBufs[ph] = "";
+            if (delta.content)           phaseBufs[ph] += delta.content;
+            if (delta.reasoning_content) phaseBufs[ph] += delta.reasoning_content;
+          }
+          if (d.usage) usageData = d.usage;
+        } catch {}
+      }
+    },
+  };
+
+  console.log(`[Test] ── Streaming (debug output di bawah) ─────────────────`);
+  const t1 = Date.now();
+  try {
+    await streamQwen(slot.token, chatId, promptArg, modelId, thinking, useSearch, fakeRes, id, [], "auto", []);
+    console.log(`\n[Test] ✓ Stream selesai (${Date.now() - t1}ms)`);
+  } catch (e) {
+    console.error(`\n[Test] ✗ Stream error: ${e.message} (${Date.now() - t1}ms)`);
+  }
+
+  delChat(slot.token, chatId);
+
+  console.log(`\n[Test] ── Hasil ──────────────────────────────────────────────`);
+  const phaseList = Object.entries(phaseBufs);
+  if (!phaseList.length) {
+    console.log(`  ⚠ TIDAK ADA CONTENT — empty response`);
+    console.log(`  Possible causes:`);
+    console.log(`    - Token expired / invalid`);
+    console.log(`    - Model name salah (coba --model qwen3.7-plus)`);
+    console.log(`    - Payload structure berubah lagi`);
+    console.log(`    - Qwen rate-limit / maintenance`);
+  } else {
+    for (const [ph, text] of phaseList) {
+      const preview = text.trim().slice(0, 400) || "(empty string)";
+      const status  = text.trim() ? "✓" : "⚠ EMPTY";
+      console.log(`  ${status} [${ph}] len=${text.length} | "${preview}${text.length > 400 ? "…" : ""}"`);
+    }
+  }
+  if (usageData) {
+    console.log(`\n[Test] usage: ${JSON.stringify(usageData)}`);
+  }
+  console.log(`[Test] raw SSE lines received: ${rawLines.length}`);
+  console.log(`[Test] total elapsed: ${Date.now() - t0}ms`);
+  console.log(`[Test] ════════════════════════════════════════════════════\n`);
+}
+
+// ── Entrypoint ─────────────────────────────────────────────────────────────
+if (process.argv[2] === "test") {
+  runTest().then(() => process.exit(0)).catch(e => { console.error(e); process.exit(1); });
+} else {
+  server.listen(PORT, () => {
+    console.log(`[QwenProxy] ✓ http://127.0.0.1:${PORT}/v1  (${POOL.length} token siap)`);
+    const { modelId: defaultModelId } = mapModel(DEFAULT_MODEL);
+    console.log(`[QwenProxy] Pre-warming ${SESSION_BUFFER} sessions for ${defaultModelId}...`);
+    for (let i = 0; i < SESSION_BUFFER; i++) preWarmSession(defaultModelId);
+  });
+}
