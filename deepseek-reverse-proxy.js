@@ -527,11 +527,33 @@ function parseToolUse(content) {
   const re = /<tool_calling>\s*<name>([^<]+)<\/name>\s*<arguments>([\s\S]+?)<\/arguments>\s*<\/tool_calling>/g;
   let m;
   while ((m = re.exec(content)) !== null) {
-    const args = m[2].trim().replace(/\s+/g, " ");
+    const name = m[1].trim();
+    let args   = m[2].trim();
+
+    // ── JSON validation — drop kalau malformed/truncated ─────────────────────
+    try {
+      JSON.parse(args);
+    } catch {
+      // Coba repair sederhana: trailing comma, whitespace cleanup
+      const repaired = args
+        .replace(/,\s*([}\]])/g, "$1")   // trailing commas
+        .replace(/\n+/g, " ")            // newlines → spaces
+        .trim();
+      try {
+        JSON.parse(repaired);
+        args = repaired;
+        console.warn(`[DeepSeekProxy] parseToolUse: args JSON repaired untuk "${name}"`);
+      } catch {
+        // Tidak bisa direpair — drop
+        console.warn(`[DeepSeekProxy] parseToolUse: args invalid JSON untuk "${name}" → drop | ${args.slice(0,100)}`);
+        continue;
+      }
+    }
+
     calls.push({
       id:   `tool_${calls.length}`,
       type: "function",
-      function: { name: m[1].trim(), arguments: args },
+      function: { name, arguments: args },
     });
   }
   return calls.length ? calls : null;
@@ -792,9 +814,15 @@ function sseChunk(id, model, content, done = false) {
 function emitToolCalls(res, id, model, answerBuf) {
   const toolCalls = parseToolUse(answerBuf);
   if (!toolCalls) {
+    // parseToolUse gagal — mungkin truncated atau args invalid JSON.
+    // Tetap kirim finish_reason supaya agent tidak dapat "empty stream with no finish_reason".
+    // Pakai "tool_calls" bukan "stop" supaya agent tahu ada tool call yang gagal parse,
+    // bukan response teks biasa yang selesai normal.
+    const hasMarker = hasToolUse(answerBuf);
+    console.warn(`[DeepSeekProxy] emitToolCalls: parseToolUse return null${hasMarker ? " (ada marker tapi truncated/invalid)" : ""}`);
     res.write(`data: ${JSON.stringify({
       id, model, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000),
-      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      choices: [{ index: 0, delta: {}, finish_reason: hasMarker ? "tool_calls" : "stop" }],
     })}\n\n`);
     return false;
   }
@@ -875,6 +903,7 @@ function streamDeepSeek(slot, chatPayload, res, id, modelId, activeTools) {
       let resolved      = false;
       let lineBuf       = "";
       let currentType   = "";  // "thinking" | "content"
+      let finishReasonSent = false;  // safety flag: pastikan finish_reason selalu dikirim sebelum [DONE]
 
       let _idleTimer = null, _totalTimer = null;
       function _clearTimers() {
@@ -905,11 +934,27 @@ function streamDeepSeek(slot, chatPayload, res, id, modelId, activeTools) {
         _clearTimers();
         resolved = true;
         if (activeTools && hasToolUse(answerBuf)) {
-          emitToolCalls(res, id, modelId, answerBuf);
+          const emitted = emitToolCalls(res, id, modelId, answerBuf);
+          finishReasonSent = true;
+          if (!emitted) {
+            // parseToolUse gagal — flush sisa teks yang belum keluar sebagai konten biasa
+            const tail = answerBuf.slice(sentUpTo).replace(/<tool_calling[\s\S]*$/i, "").trim();
+            if (tail) res.write(sseChunk(id, modelId, tail));
+          }
         } else {
           const tail = answerBuf.slice(sentUpTo);
           if (tail) res.write(sseChunk(id, modelId, tail));
           res.write(sseChunk(id, modelId, "", true));
+          finishReasonSent = true;
+        }
+        // Safety net: kalau finish_reason belum terkirim karena path yang tidak terduga
+        if (!finishReasonSent) {
+          console.warn("[DeepSeekProxy] done() safety net: force emit finish_reason=stop");
+          res.write(`data: ${JSON.stringify({
+            id, object: "chat.completion.chunk", model: modelId,
+            created: Math.floor(Date.now() / 1000),
+            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          })}\n\n`);
         }
         res.write("data: [DONE]\n\n");
         resolve();
@@ -990,6 +1035,7 @@ function streamDeepSeek(slot, chatPayload, res, id, modelId, activeTools) {
                 resolved = true;
                 _clearTimers();
                 emitToolCalls(res, id, modelId, answerBuf);
+                finishReasonSent = true;
                 res.write("data: [DONE]\n\n");
                 resolve();
               }
