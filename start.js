@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -21,17 +22,6 @@ const step = m => console.log(`\n${C.bold}${C.white}${m}${C.reset}`);
 
 // Windows tidak punya SIGTERM native — kirim sinyal yang benar sesuai platform
 const safeKill = proc => { try { proc.kill(process.platform === "win32" ? undefined : "SIGTERM"); } catch {} };
-
-// ─── NON-INTERACTIVE / VPS FIX ───────────────────────────────────────────────
-// --yes / -y       → jawab semua Y/N prompt biasa dengan default (berguna di VPS tanpa TTY)
-// --patch-soul     → paksa patch soul.md tanpa tanya (non-TTY)
-// --no-patch-soul  → paksa skip soul.md tanpa tanya (non-TTY)
-const FORCE_YES      = process.argv.includes("--yes") || process.argv.includes("-y");
-const SOUL_FLAG      = process.argv.includes("--patch-soul")    ? "yes"
-                     : process.argv.includes("--no-patch-soul") ? "no"
-                     : null;  // null = tanya interaktif (default)
-// Deteksi otomatis: stdin bukan TTY = non-interactive (PM2, nohup, panel web, dll)
-const IS_TTY         = !!process.stdin.isTTY;
 
 const MARKER          = path.join(__dirname, ".setup-done");
 const ENV_FILE        = path.join(__dirname, ".env.qwen");
@@ -64,11 +54,13 @@ const CLAW_DIR = process.env.OPENCLAW_HOME
 const CLAW_CFG    = path.join(CLAW_DIR, "openclaw.json");
 
 const PROXY_JS      = path.join(__dirname, "reverse-proxy.js");
-const KIMI_PROXY_JS = path.join(__dirname, "kimi-reverse-proxy.js");
-const SOUL_MD       = path.join(__dirname, "soul.md");
+const KIMI_PROXY_JS     = path.join(__dirname, "kimi-reverse-proxy.js");
+const DEEPSEEK_PROXY_JS = path.join(__dirname, "deepseek-reverse-proxy.js");
+const SOUL_MD           = path.join(__dirname, "soul.md");
 
-// Env file untuk Kimi tokens
-const ENV_FILE_KIMI = path.join(__dirname, ".env.kimi");
+// Env file untuk Kimi + DeepSeek tokens
+const ENV_FILE_KIMI     = path.join(__dirname, ".env.kimi");
+const ENV_FILE_DEEPSEEK = path.join(__dirname, ".env.deepseek");
 
 // Agent yang dipakai: env AGENT > .agent-type > default "hermes"
 function resolveAgent() {
@@ -98,7 +90,7 @@ function resolveProxyType(argOverride) {
   if (process.env.PROXY) return process.env.PROXY.toLowerCase();
   if (fs.existsSync(PROXY_TYPE_FILE)) {
     const saved = fs.readFileSync(PROXY_TYPE_FILE, "utf8").trim();
-    if (saved === "kimi" || saved === "qwen") return saved;
+    if (saved === "kimi" || saved === "qwen" || saved === "deepseek") return saved;
   }
   return "qwen";
 }
@@ -226,6 +218,13 @@ function loadEnv() {
       if (m && !process.env[m[1]]) process.env[m[1]] = m[2].trim();
     }
   }
+  // Load .env.deepseek (deepseek tokens) jika ada
+  if (fs.existsSync(ENV_FILE_DEEPSEEK)) {
+    for (const line of fs.readFileSync(ENV_FILE_DEEPSEEK, "utf8").split("\n")) {
+      const m = line.match(/^([A-Z0-9_]+)=(.+)$/);
+      if (m && !process.env[m[1]]) process.env[m[1]] = m[2].trim();
+    }
+  }
 }
 
 function cmdExists(cmd) {
@@ -280,12 +279,18 @@ function patchConfigClaw(tgToken, proxyType = "qwen") {
     try { config = JSON.parse(fs.readFileSync(CLAW_CFG, "utf8")); } catch {}
   }
 
-  const isKimi    = proxyType === "kimi";
-  const baseUrl   = isKimi ? "http://localhost:4892/v1" : "http://localhost:4891/v1";
-  const modelId   = isKimi
-    ? (process.env.KIMI_MODEL || "kimi-k2.6")
-    : (process.env.QWEN_MODEL  || "qwen3.7-max");
-  const provName  = isKimi ? "kimi-proxy" : "qwen-proxy";
+  const isKimi     = proxyType === "kimi";
+  const isDeepSeek = proxyType === "deepseek";
+  const baseUrl    = isKimi ? "http://localhost:4892/v1"
+                   : isDeepSeek ? "http://localhost:4893/v1"
+                   : "http://localhost:4891/v1";
+  const modelId    = isKimi
+    ? (process.env.KIMI_MODEL     || "kimi-k2.6")
+    : isDeepSeek
+    ? (process.env.DEEPSEEK_MODEL || "deepseek-chat")
+    : (process.env.QWEN_MODEL     || "qwen3.7-max");
+  const provName   = isKimi ? "kimi-proxy" : isDeepSeek ? "deepseek-proxy" : "qwen-proxy";
+  const modelName  = isKimi ? "Kimi K2.6" : isDeepSeek ? "DeepSeek Chat" : "Qwen 3.7 Max";
 
   // ── 1. gateway mode ──────────────────────────────────────────────────────
   if (!config.gateway) config.gateway = {};
@@ -300,14 +305,13 @@ function patchConfigClaw(tgToken, proxyType = "qwen") {
   };
 
   // ── 3. Model catalog (models.providers) ─────────────────────────────────
-  // OpenClaw pakai models.providers.<id>.{baseUrl, apiKey, api, models[]}
-  // ref: https://docs.openclaw.ai/gateway/config-tools#custom-providers-and-base-urls
   if (!config.models || Array.isArray(config.models)) config.models = {};
   if (!config.models.providers) config.models.providers = {};
 
-  // Hapus entry proxy lama (qwen-proxy/kimi-proxy) supaya tidak duplikat
+  // Hapus entry proxy lama supaya tidak duplikat
   delete config.models.providers["qwen-proxy"];
   delete config.models.providers["kimi-proxy"];
+  delete config.models.providers["deepseek-proxy"];
 
   config.models.providers[provName] = {
     baseUrl: baseUrl,
@@ -316,8 +320,8 @@ function patchConfigClaw(tgToken, proxyType = "qwen") {
     models:  [
       {
         id:            modelId,
-        name:          isKimi ? "Kimi K2.6" : "Qwen 3.7 Max",
-        reasoning:     false,
+        name:          modelName,
+        reasoning:     isDeepSeek || false,
         input:         ["text"],
         cost:          { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 131072,
@@ -335,14 +339,8 @@ function patchConfigClaw(tgToken, proxyType = "qwen") {
   };
 
   // ── 5. Web search tools ──────────────────────────────────────────────────
-  // Qwen proxy sekarang support auto_search native (auto-detect tool web_search),
-  // jadi tools.profile "coding" (sudah include group:web) sudah cukup.
-  // Tidak perlu external API key untuk kedua backend.
   if (!config.tools) config.tools = {};
   config.tools.profile = "coding";
-
-  // ── 6. Soul.md sebagai system prompt (opsional, lewat agents.defaults) ───
-  // Diinject terpisah via patchClawSoulMd() setelah file ini selesai ditulis.
 
   if (!fs.existsSync(CLAW_DIR)) fs.mkdirSync(CLAW_DIR, { recursive: true });
   backupFile(CLAW_CFG);
@@ -448,50 +446,11 @@ print("OK")
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
-/**
- * Tanya Y/N.
- * @param {string}  question    - teks pertanyaan
- * @param {boolean} defaultYes  - nilai default kalau Enter / auto
- * @param {boolean} mustChoose  - true = prompt KRITIS, tidak boleh di-auto-yes;
- *                                kalau non-TTY → default NO + tampilkan instruksi flag
- */
-function askYN(question, defaultYes = true, mustChoose = false) {
+/** Tanya Y/N — default yes */
+function askYN(question, defaultYes = true) {
   return new Promise(resolve => {
     const hint = defaultYes ? "[Y/n]" : "[y/N]";
-
-    // Prompt KRITIS (mustChoose=true): tidak boleh di-auto-yes secara buta
-    if (mustChoose && !IS_TTY) {
-      // Cek apakah user sudah eksplisit kasih flag --patch-soul / --no-patch-soul
-      if (SOUL_FLAG === "yes") {
-        console.log(`  ${question} ${hint}: Y  ${C.gray}(--patch-soul flag)${C.reset}`);
-        resolve(true);
-      } else if (SOUL_FLAG === "no") {
-        console.log(`  ${question} ${hint}: N  ${C.gray}(--no-patch-soul flag)${C.reset}`);
-        resolve(false);
-      } else {
-        // Tidak ada flag → default NO + tampilkan petunjuk
-        console.log(`\n${C.yellow}⚠  Prompt ini butuh pilihan manual, tapi stdin bukan TTY.${C.reset}`);
-        console.log(`   ${C.cyan}${question}${C.reset}`);
-        console.log(`   Untuk mengontrolnya, tambahkan flag saat jalankan:`);
-        console.log(`     ${C.green}--patch-soul${C.reset}    → otomatis patch soul.md`);
-        console.log(`     ${C.yellow}--no-patch-soul${C.reset} → otomatis skip soul.md`);
-        console.log(`   Contoh: ${C.cyan}node start.js gateway --patch-soul${C.reset}\n`);
-        console.log(`   ${C.gray}Sekarang: skip soul.md (default aman)${C.reset}\n`);
-        resolve(false);
-      }
-      return;
-    }
-
-    // Prompt biasa (mustChoose=false): boleh auto kalau non-TTY atau --yes
-    if (!mustChoose && (FORCE_YES || !IS_TTY)) {
-      const defLabel = defaultYes ? "Y" : "N";
-      const reason   = FORCE_YES ? "--yes flag" : "stdin bukan TTY";
-      console.log(`  ${question} ${hint}: ${defLabel}  ${C.gray}(auto: ${reason})${C.reset}`);
-      resolve(defaultYes);
-      return;
-    }
-
-    const rl2 = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const rl2  = readline.createInterface({ input: process.stdin, output: process.stdout });
     rl2.question(`  ${question} ${hint}: `, ans => {
       rl2.close();
       const a = ans.trim().toLowerCase();
@@ -506,7 +465,7 @@ function askYN(question, defaultYes = true, mustChoose = false) {
  * Yang diubah:
  *   - model.default + model.base_url
  *   - custom_providers (entry proxy)
- *   - plugins.enabled  (image_gen dimatikan untuk kimi)
+ *   - plugins.enabled  (image_gen dimatikan untuk kimi/deepseek)
  *   - image_gen section
  */
 function patchHermesConfig(proxyType = "qwen") {
@@ -522,55 +481,64 @@ function patchHermesConfig(proxyType = "qwen") {
     return;
   }
 
-  const isKimi     = proxyType === "kimi";
-  const kimiModel  = (process.env.KIMI_MODEL || "kimi-k2.6").replace(/"/g, "");
-  const qwenModel  = (process.env.QWEN_MODEL  || "qwen3.7-max").replace(/"/g, "");
-  const cfgPathEsc = HERMES_CFG.replace(/\\/g, "/");
+  const kimiModel     = (process.env.KIMI_MODEL     || "kimi-k2.6").replace(/"/g, "");
+  const qwenModel     = (process.env.QWEN_MODEL      || "qwen3.7-max").replace(/"/g, "");
+  const deepseekModel = (process.env.DEEPSEEK_MODEL  || "deepseek-chat").replace(/"/g, "");
+  const cfgPathEsc    = HERMES_CFG.replace(/\\/g, "/");
 
   const tmpPy = path.join(os.tmpdir(), "hermes_patch_proxy_cfg.py");
   fs.writeFileSync(tmpPy, `
 import yaml
 
-config_path = r"${cfgPathEsc}"
-is_kimi     = ${isKimi ? "True" : "False"}
-kimi_model  = "${kimiModel}"
-qwen_model  = "${qwenModel}"
+config_path    = r"${cfgPathEsc}"
+proxy_type     = "${proxyType}"
+kimi_model     = "${kimiModel}"
+qwen_model     = "${qwenModel}"
+deepseek_model = "${deepseekModel}"
 
 with open(config_path, encoding="utf-8") as f:
     cfg = yaml.safe_load(f) or {}
+
+# ── Pilih nilai berdasarkan proxy_type ───────────────────────────────────────
+if proxy_type == "kimi":
+    default_model  = kimi_model
+    base_url       = "http://localhost:4892/v1"
+    provider_name  = "kimi proxy"
+    provider_model = kimi_model
+elif proxy_type == "deepseek":
+    default_model  = deepseek_model
+    base_url       = "http://localhost:4893/v1"
+    provider_name  = "deepseek proxy"
+    provider_model = deepseek_model
+else:  # qwen
+    default_model  = qwen_model
+    base_url       = "http://localhost:4891/v1"
+    provider_name  = "qwen proxy"
+    provider_model = "qwen3.7-plus"
 
 # ── 1. model section ────────────────────────────────────────────────────────
 if "model" not in cfg:
     cfg["model"] = {}
 
-cfg["model"]["default"]  = kimi_model if is_kimi else qwen_model
-cfg["model"]["base_url"] = "http://localhost:4892/v1" if is_kimi else "http://localhost:4891/v1"
+cfg["model"]["default"]  = default_model
+cfg["model"]["base_url"] = base_url
 cfg["model"]["provider"] = "custom"
 cfg["model"]["api_key"]  = "proxy-key"
 cfg["model"]["api_mode"] = "chat_completions"
 
 # ── 2. custom_providers ─────────────────────────────────────────────────────
 providers = cfg.get("custom_providers") or []
-# Hapus entry lama qwen/kimi proxy
+# Hapus entry lama semua proxy
 providers = [p for p in providers if isinstance(p, dict)
-             and p.get("name") not in ("qwen proxy", "kimi proxy")]
+             and p.get("name") not in ("qwen proxy", "kimi proxy", "deepseek proxy")]
 
-if is_kimi:
-    providers.insert(0, {
-        "name":     "kimi proxy",
-        "base_url": "http://localhost:4892/v1",
-        "api_key":  "proxy-key",
-        "model":    kimi_model,
-        "api_mode": "chat_completions",
-    })
-else:
-    providers.insert(0, {
-        "name":     "qwen proxy",
-        "base_url": "http://localhost:4891/v1",
-        "api_key":  "proxy-key",
-        "model":    "qwen3.7-plus",
-        "api_mode": "chat_completions",
-    })
+providers.insert(0, {
+    "name":     provider_name,
+    "base_url": base_url,
+    "api_key":  "proxy-key",
+    "model":    provider_model,
+    "api_mode": "chat_completions",
+})
 cfg["custom_providers"] = providers
 
 # ── 3. plugins + image_gen ──────────────────────────────────────────────────
@@ -581,8 +549,8 @@ enabled = plugins.get("enabled") or []
 if not isinstance(enabled, list):
     enabled = []
 
-if is_kimi:
-    # Kimi tidak support image gen — nonaktifkan plugin
+if proxy_type in ("kimi", "deepseek"):
+    # Kimi & DeepSeek tidak support image gen — nonaktifkan plugin
     enabled = [p for p in enabled if p != "image_gen/qwen-proxy"]
     cfg["image_gen"] = {"provider": "none", "use_gateway": False, "model": ""}
 else:
@@ -602,8 +570,8 @@ if not isinstance(cfg["auxiliary"], dict):
 if "vision" not in cfg["auxiliary"] or not isinstance(cfg["auxiliary"]["vision"], dict):
     cfg["auxiliary"]["vision"] = {}
 
-cfg["auxiliary"]["vision"]["base_url"] = "http://localhost:4892/v1" if is_kimi else "http://localhost:4891/v1"
-cfg["auxiliary"]["vision"]["model"]    = kimi_model if is_kimi else qwen_model
+cfg["auxiliary"]["vision"]["base_url"] = base_url
+cfg["auxiliary"]["vision"]["model"]    = default_model
 cfg["auxiliary"]["vision"]["api_key"]  = "proxy-key"
 
 with open(config_path, "w", encoding="utf-8") as f:
@@ -619,7 +587,7 @@ print("OK")
   try {
     const r = runPatch();
     if (r === "OK") {
-      const label = isKimi ? "Kimi" : "Qwen";
+      const label = proxyType === "kimi" ? "Kimi" : proxyType === "deepseek" ? "DeepSeek" : "Qwen";
       ok(`config.yaml diperbarui untuk ${label} proxy`);
     }
   } catch (e) {
@@ -651,8 +619,9 @@ function patchHermesEnv(proxyType = "qwen") {
   if (AGENT !== "hermes") return;
   if (!fs.existsSync(HERMES_HOME)) return;
 
-  const isKimi  = proxyType === "kimi";
-  const baseUrl = isKimi ? "http://localhost:4892/v1" : "http://localhost:4891/v1";
+  const baseUrl = proxyType === "kimi"     ? "http://localhost:4892/v1"
+                : proxyType === "deepseek" ? "http://localhost:4893/v1"
+                : "http://localhost:4891/v1";
 
   let content = fs.existsSync(HERMES_ENV) ? fs.readFileSync(HERMES_ENV, "utf8") : "";
 
@@ -672,8 +641,9 @@ function patchHermesEnv(proxyType = "qwen") {
 // ─── WEB SEARCH BACKEND PATCHER ───────────────────────────────────────────────
 /**
  * Patch web.search_backend & web.extract_backend di config.yaml.
- *  - Kimi  → "kimi"    (proxy sudah handle natively via $web_search tool)
- *  - Qwen  → tetap "tavily" (butuh API key external)
+ *  - Kimi     → "kimi"     (proxy sudah handle natively via $web_search tool)
+ *  - DeepSeek → "deepseek" (proxy sudah handle natively via search_enabled flag)
+ *  - Qwen     → tetap "tavily" (butuh API key external)
  */
 function patchWebSearchBackend(proxyType = "qwen") {
   if (AGENT !== "hermes") return;
@@ -685,7 +655,6 @@ function patchWebSearchBackend(proxyType = "qwen") {
   const pyCmd = findPython();
   if (!pyCmd) { warn("Python tidak ditemukan, skip patch web search backend."); return; }
 
-  const isKimi     = proxyType === "kimi";
   const cfgPathEsc = HERMES_CFG.replace(/\\/g, "/");
 
   const tmpPy = path.join(os.tmpdir(), "hermes_patch_websearch.py");
@@ -693,7 +662,7 @@ function patchWebSearchBackend(proxyType = "qwen") {
 import yaml
 
 config_path = r"${cfgPathEsc}"
-is_kimi     = ${isKimi ? "True" : "False"}
+proxy_type  = "${proxyType}"
 
 with open(config_path, encoding="utf-8") as f:
     cfg = yaml.safe_load(f) or {}
@@ -701,12 +670,11 @@ with open(config_path, encoding="utf-8") as f:
 if "web" not in cfg:
     cfg["web"] = {}
 
-if is_kimi:
-    # Kimi proxy sudah support $web_search native — arahkan Hermes web tools ke kimi backend
-    # yang akan di-relay lewat kimi-reverse-proxy.js (auto-detect tool "web_search")
+if proxy_type in ("kimi", "deepseek"):
+    # Kimi & DeepSeek proxy sudah support $web_search native
     cfg["web"]["backend"]         = ""
-    cfg["web"]["search_backend"]  = "kimi"
-    cfg["web"]["extract_backend"] = "kimi"
+    cfg["web"]["search_backend"]  = proxy_type
+    cfg["web"]["extract_backend"] = proxy_type
 else:
     # Qwen — pakai Tavily (key sudah harus ada di .env)
     cfg["web"]["backend"]         = ""
@@ -724,8 +692,10 @@ print("OK")
   try {
     const r = run();
     if (r === "OK") {
-      if (isKimi) {
+      if (proxyType === "kimi") {
         ok(`web search backend → kimi (native via proxy)`);
+      } else if (proxyType === "deepseek") {
+        ok(`web search backend → deepseek (native via proxy)`);
       } else {
         ok(`web search backend → tavily (pastikan TAVILY_API_KEY ada di ~/.hermes/.env)`);
       }
@@ -767,26 +737,33 @@ function patchClawConfig(proxyType = "qwen") {
     return;
   }
 
-  const isKimi  = proxyType === "kimi";
-  const baseUrl = isKimi ? "http://localhost:4892/v1" : "http://localhost:4891/v1";
-  const modelId = isKimi
-    ? (process.env.KIMI_MODEL || "kimi-k2.6")
-    : (process.env.QWEN_MODEL  || "qwen3.7-max");
-  const provName = isKimi ? "kimi-proxy" : "qwen-proxy";
+  const isKimi     = proxyType === "kimi";
+  const isDeepSeek = proxyType === "deepseek";
+  const baseUrl    = isKimi     ? "http://localhost:4892/v1"
+                   : isDeepSeek ? "http://localhost:4893/v1"
+                   : "http://localhost:4891/v1";
+  const modelId    = isKimi
+    ? (process.env.KIMI_MODEL     || "kimi-k2.6")
+    : isDeepSeek
+    ? (process.env.DEEPSEEK_MODEL || "deepseek-chat")
+    : (process.env.QWEN_MODEL      || "qwen3.7-max");
+  const provName   = isKimi ? "kimi-proxy" : isDeepSeek ? "deepseek-proxy" : "qwen-proxy";
+  const modelName  = isKimi ? "Kimi K2.6" : isDeepSeek ? "DeepSeek Chat" : "Qwen 3.7 Max";
 
   // Update model provider
   if (!config.models || Array.isArray(config.models)) config.models = {};
   if (!config.models.providers) config.models.providers = {};
   delete config.models.providers["qwen-proxy"];
   delete config.models.providers["kimi-proxy"];
+  delete config.models.providers["deepseek-proxy"];
   config.models.providers[provName] = {
     baseUrl: baseUrl,
     apiKey:  "proxy-key",
     api:     "openai-completions",
     models:  [{
       id:            modelId,
-      name:          isKimi ? "Kimi K2.6" : "Qwen 3.7 Max",
-      reasoning:     false,
+      name:          modelName,
+      reasoning:     isDeepSeek || false,
       input:         ["text"],
       cost:          { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: 131072,
@@ -819,17 +796,16 @@ function patchClawConfig(proxyType = "qwen") {
  */
 async function maybePatchConfig(proxyType = "qwen") {
   if (AGENT === "openclaw") {
-    // OpenClaw: langsung patch tanpa tanya (non-destructive, hanya update model/provider)
     patchClawConfig(proxyType);
     return;
   }
 
-  // ── Hermes path ────────────────────────────────────────────────────────────
   if (AGENT !== "hermes") return;
 
-  const isKimi   = proxyType === "kimi";
-  const label    = isKimi ? "Kimi" : "Qwen";
-  const cfgOk    = fs.existsSync(HERMES_CFG);
+  const isKimi     = proxyType === "kimi";
+  const isDeepSeek = proxyType === "deepseek";
+  const label      = isKimi ? "Kimi" : isDeepSeek ? "DeepSeek" : "Qwen";
+  const cfgOk      = fs.existsSync(HERMES_CFG);
 
   step(`Patch Hermes config (${label} mode)`);
   console.log(`${C.gray}
@@ -845,80 +821,63 @@ ${C.reset}`);
   );
 
   if (!wantPatch) {
+    const baseUrl = isKimi     ? "http://localhost:4892/v1"
+                  : isDeepSeek ? "http://localhost:4893/v1"
+                  : "http://localhost:4891/v1";
+    const model   = isKimi ? "kimi-k2.6" : isDeepSeek ? "deepseek-chat" : "qwen3-max";
+    const pname   = isKimi ? "kimi proxy" : isDeepSeek ? "deepseek proxy" : "qwen proxy";
+    const pmodel  = isKimi ? "kimi-k2.6" : isDeepSeek ? "deepseek-chat" : "qwen3.7-plus";
+    const sbackend = (isKimi || isDeepSeek) ? proxyType : "tavily";
     console.log(`
 ${C.yellow}Manual setup — lihat README.md untuk langkah-langkah berikut:${C.reset}
 
   ${C.cyan}Di ~/.hermes/config.yaml${C.reset} pastikan bagian ini ada/diubah:
   ${C.gray}─────────────────────────────────────────────────────${C.reset}
-${isKimi ? `  model:
-    default: kimi-k2.6
+  model:
+    default: ${model}
     provider: custom
-    base_url: http://localhost:4892/v1
+    base_url: ${baseUrl}
     api_key: proxy-key
     api_mode: chat_completions
 
   auxiliary:
     vision:
-      base_url: http://localhost:4892/v1
-      model: kimi-k2.6
+      base_url: ${baseUrl}
+      model: ${model}
       api_key: proxy-key
 
   web:
     backend: ""
-    search_backend: kimi
-    extract_backend: kimi
+    search_backend: ${sbackend}
+    extract_backend: ${sbackend}
 
   custom_providers:
-    - name: kimi proxy
-      base_url: http://localhost:4892/v1
+    - name: ${pname}
+      base_url: ${baseUrl}
       api_key: proxy-key
-      model: kimi-k2.6
-      api_mode: chat_completions` :
-`  model:
-    default: qwen3-max
-    provider: custom
-    base_url: http://localhost:4891/v1
-    api_key: proxy-key
-    api_mode: chat_completions
-
-  web:
-    backend: ""
-    search_backend: tavily
-    extract_backend: tavily
-
-  custom_providers:
-    - name: qwen proxy
-      base_url: http://localhost:4891/v1
-      api_key: proxy-key
-      model: qwen3.7-plus
-      api_mode: chat_completions`}
+      model: ${pmodel}
+      api_mode: chat_completions
   ${C.gray}─────────────────────────────────────────────────────${C.reset}
 
   ${C.cyan}Di ~/.hermes/.env${C.reset} pastikan ada:
-    OPENAI_BASE_URL=${isKimi ? "http://localhost:4892/v1" : "http://localhost:4891/v1"}
+    OPENAI_BASE_URL=${baseUrl}
     OPENAI_API_KEY=proxy-key
-${!isKimi ? `    TAVILY_API_KEY=tvly-xxxx...   ← ambil di https://app.tavily.com
-` : ""}
-  Setelah edit manual, jalankan lagi: ${C.cyan}node start.js ${isKimi ? "proxy kimi" : "proxy"}${C.reset}
+${(!isKimi && !isDeepSeek) ? `    TAVILY_API_KEY=tvly-xxxx...   ← ambil di https://app.tavily.com\n` : ""}
+  Setelah edit manual, jalankan lagi: ${C.cyan}node start.js proxy ${proxyType}${C.reset}
 `);
     return;
   }
 
-  // ── Backup dulu sebelum patch ──────────────────────────────────────────────
   backupFile(HERMES_CFG);
   backupFile(HERMES_ENV);
 
-  // ── Lakukan patch ──────────────────────────────────────────────────────────
   patchHermesConfig(proxyType);
   patchHermesEnv(proxyType);
   patchWebSearchBackend(proxyType);
 
-  // ── Tampilkan semua backup yang ada ────────────────────────────────────────
   showBackupSummary();
 
-  // ── Post-patch info ────────────────────────────────────────────────────────
-  if (!isKimi) {
-    // Qwen: cek apakah TAVILY_API_KEY sudah ada
+  if (!isKimi && !isDeepSeek) {
     const hasTavily = !!(process.env.TAVILY_API_KEY ||
       (fs.existsSync(HERMES_ENV) && fs.readFileSync(HERMES_ENV, "utf8").includes("TAVILY_API_KEY=")));
 
@@ -941,18 +900,20 @@ ${C.yellow}⚠  Web Search untuk Qwen butuh Tavily API key!${C.reset}
   Set di config.yaml:  web.search_backend: ddgs${C.reset}
 `);
     }
-  } else {
-    // Kimi: info bahwa web search sudah built-in via proxy
+  } else if (isKimi) {
     ok("Kimi web search: sudah built-in via kimi-reverse-proxy.js");
     info("Setiap request yang ada tool 'web_search' otomatis di-relay ke Kimi native search.");
     info("Tidak perlu API key tambahan untuk web search.");
+  } else {
+    ok("DeepSeek web search: sudah built-in via deepseek-reverse-proxy.js");
+    info("Aktifkan dengan header  x-deepseek-search: true  atau  enable_search: true.");
+    info("Tidak perlu API key tambahan untuk web search.");
   }
 
-  // Soul.md — prompt KRITIS, user harus pilih sendiri (mustChoose=true)
   if (fs.existsSync(SOUL_MD) && fs.existsSync(HERMES_CFG)) {
-    const patchSoul = await askYN(`Patch soul.md → config.yaml? (${fs.statSync(SOUL_MD).size} bytes)`, true, true);
+    const patchSoul = await askYN(`Patch soul.md → config.yaml? (${fs.statSync(SOUL_MD).size} bytes)`);
     if (patchSoul) {
-      backupFile(HERMES_CFG); // no-op kalau sudah di-backup sesi ini
+      backupFile(HERMES_CFG);
       patchSoulMd();
       showBackupSummary();
     }
@@ -1148,24 +1109,28 @@ ${C.reset}`);
 
 // ─── RUN HELPERS ─────────────────────────────────────────────────────────────
 function ensureConfig(proxyType = "qwen") {
-  const isKimi = proxyType === "kimi";
+  const isKimi     = proxyType === "kimi";
+  const isDeepSeek = proxyType === "deepseek";
 
-  if (!isKimi && !process.env.QWEN_TOKEN_1) {
+  if (!isKimi && !isDeepSeek && !process.env.QWEN_TOKEN_1) {
     err("QWEN_TOKEN_1 tidak ditemukan. Jalankan: node start.js --reset");
     process.exit(1);
   }
+  if (isDeepSeek && !process.env.DEEPSEEK_TOKEN_1) {
+    err("DEEPSEEK_TOKEN_1 tidak ditemukan. Buat .env.deepseek dengan DEEPSEEK_TOKEN_1=<token>");
+    info("Format .env.deepseek:\n  DEEPSEEK_TOKEN_1=eyJ...\n  # (Bearer token dari browser DeepSeek)");
+    process.exit(1);
+  }
+
+  const baseUrl = isKimi     ? "http://localhost:4892/v1"
+                : isDeepSeek ? "http://localhost:4893/v1"
+                : "http://localhost:4891/v1";
 
   if (AGENT === "hermes") {
-    // Base URL tergantung proxy type
-    if (!process.env.OPENAI_BASE_URL) {
-      process.env.OPENAI_BASE_URL = isKimi ? "http://localhost:4892/v1" : "http://localhost:4891/v1";
-    }
-    if (!process.env.OPENAI_API_KEY) {
-      process.env.OPENAI_API_KEY = "proxy-key";
-    }
+    if (!process.env.OPENAI_BASE_URL) process.env.OPENAI_BASE_URL = baseUrl;
+    if (!process.env.OPENAI_API_KEY)  process.env.OPENAI_API_KEY  = "proxy-key";
   } else {
-    // OpenClaw: set base URL env supaya openclaw gateway tahu ke mana connect
-    process.env.OPENAI_BASE_URL = isKimi ? "http://localhost:4892/v1" : "http://localhost:4891/v1";
+    process.env.OPENAI_BASE_URL = baseUrl;
     process.env.OPENAI_API_KEY  = "proxy-key";
     if (fs.existsSync(CLAW_CFG)) {
       try {
@@ -1182,11 +1147,10 @@ function ensureConfig(proxyType = "qwen") {
 
 function startProxy(proxyType) {
   loadEnv();
-  // Resolve proxy type: arg > PROXY env > .proxy-type > default "qwen"
-  const type = resolveProxyType(proxyType);
-  const isKimi = type === "kimi";
+  const type       = resolveProxyType(proxyType);
+  const isKimi     = type === "kimi";
+  const isDeepSeek = type === "deepseek";
 
-  // Simpan pilihan ini supaya gateway & proxy berikutnya bisa baca tanpa arg
   saveProxyType(type);
   info(`Proxy type disimpan: ${type} → gunakan 'node start.js proxy' atau 'node start.js gateway' tanpa arg`);
 
@@ -1203,18 +1167,35 @@ function startProxy(proxyType) {
     console.log(`\n${C.bold}${C.cyan}[ Kimi Reverse Proxy ]${C.reset}\n`);
     info("Memulai Kimi proxy di port 4892...");
     const proxy = spawn(process.execPath, [KIMI_PROXY_JS], {
-      env: { ...process.env },
-      stdio: "inherit",
+      env: { ...process.env }, stdio: "inherit",
     });
     proxy.on("exit", code => { if (code) err(`Kimi proxy berhenti (kode ${code})`); process.exit(code || 0); });
     process.on("SIGINT", () => { safeKill(proxy); setTimeout(() => process.exit(0), 500); });
+
+  } else if (isDeepSeek) {
+    if (!process.env.DEEPSEEK_TOKEN_1) {
+      err("DEEPSEEK_TOKEN_1 tidak ditemukan. Buat .env.deepseek dengan DEEPSEEK_TOKEN_1=<token>");
+      info("Format .env.deepseek:\n  DEEPSEEK_TOKEN_1=eyJ...\n  # (Bearer token dari browser DeepSeek)");
+      process.exit(1);
+    }
+    if (!fs.existsSync(DEEPSEEK_PROXY_JS)) {
+      err(`deepseek-reverse-proxy.js tidak ditemukan di: ${DEEPSEEK_PROXY_JS}`);
+      process.exit(1);
+    }
+    console.log(`\n${C.bold}${C.cyan}[ DeepSeek Reverse Proxy ]${C.reset}\n`);
+    info("Memulai DeepSeek proxy di port 4893...");
+    const proxy = spawn(process.execPath, [DEEPSEEK_PROXY_JS], {
+      env: { ...process.env }, stdio: "inherit",
+    });
+    proxy.on("exit", code => { if (code) err(`DeepSeek proxy berhenti (kode ${code})`); process.exit(code || 0); });
+    process.on("SIGINT", () => { safeKill(proxy); setTimeout(() => process.exit(0), 500); });
+
   } else {
     ensureConfig("qwen");
     console.log(`\n${C.bold}${C.cyan}[ Qwen Reverse Proxy ]${C.reset}\n`);
     info("Memulai Qwen proxy di port 4891...");
     const proxy = spawn(process.execPath, [PROXY_JS], {
-      env: { ...process.env },
-      stdio: "inherit",
+      env: { ...process.env }, stdio: "inherit",
     });
     proxy.on("exit", code => { if (code) err(`Proxy berhenti (kode ${code})`); process.exit(code || 0); });
     process.on("SIGINT", () => { safeKill(proxy); setTimeout(() => process.exit(0), 500); });
@@ -1257,8 +1238,9 @@ async function runAll() {
   loadEnv();
 
   // Pilih proxy: PROXY env > .proxy-type > default "qwen"
-  const proxyType = resolveProxyType(null);
-  const isKimi    = proxyType === "kimi";
+  const proxyType  = resolveProxyType(null);
+  const isKimi     = proxyType === "kimi";
+  const isDeepSeek = proxyType === "deepseek";
 
   ensureConfig(proxyType);  // sets OPENAI_BASE_URL + validates tokens
 
@@ -1271,20 +1253,25 @@ async function runAll() {
   // Patch hermes config.yaml + .env
   await maybePatchConfig(proxyType);
 
-  const proxyFile = isKimi ? KIMI_PROXY_JS : PROXY_JS;
-  const proxyTag  = isKimi ? "KIMI" : "PROXY";
+  const proxyFile = isKimi ? KIMI_PROXY_JS : isDeepSeek ? DEEPSEEK_PROXY_JS : PROXY_JS;
+  const proxyTag  = isKimi ? "KIMI" : isDeepSeek ? "DEEPSEEK" : "PROXY";
 
   if (isKimi && !process.env.KIMI_TOKEN_1) {
     err("PROXY=kimi tapi KIMI_TOKEN_1 tidak ditemukan. Cek .env.kimi");
     process.exit(1);
   }
+  if (isDeepSeek && !process.env.DEEPSEEK_TOKEN_1) {
+    err("PROXY=deepseek tapi DEEPSEEK_TOKEN_1 tidak ditemukan. Cek .env.deepseek");
+    process.exit(1);
+  }
 
   const agentLabel = AGENT === "hermes" ? "Hermes" : "OpenClaw";
-  const proxyLabel = isKimi ? "Kimi" : "Qwen";
-  console.log(`\n${C.bold}${C.cyan}╔══════════════════════════════════════════╗
-║  ${agentLabel} × ${proxyLabel} Reverse API — Starting ║
-╚══════════════════════════════════════════╝${C.reset}\n`);
-  info(`Mode gabung (${proxyLabel} proxy + gateway 1 terminal)`);
+  const proxyLabel = isKimi ? "Kimi" : isDeepSeek ? "DeepSeek" : "Qwen";
+  const portNum    = isKimi ? 4892 : isDeepSeek ? 4893 : 4891;
+  console.log(`\n${C.bold}${C.cyan}╔═══════════════════════════════════════════════╗
+║  ${agentLabel} × ${proxyLabel} Reverse API — Starting  ║
+╚═══════════════════════════════════════════════╝${C.reset}\n`);
+  info(`Mode gabung (${proxyLabel} proxy:${portNum} + gateway 1 terminal)`);
   info("Untuk pisah: buka 2 terminal →");
   console.log(`  ${C.cyan}Terminal 1:${C.reset} node start.js proxy ${proxyType}`);
   console.log(`  ${C.cyan}Terminal 2:${C.reset} node start.js gateway\n`);
@@ -1314,7 +1301,7 @@ async function runAll() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 const arg  = process.argv[2];
-const arg2 = process.argv[3];   // sub-arg: "qwen" | "kimi"
+const arg2 = process.argv[3];   // sub-arg: "qwen" | "kimi" | "deepseek"
 
 if (arg === "--reset") {
   // Deteksi config mana yang ada
@@ -1354,7 +1341,7 @@ if (arg === "--reset") {
   }
 
   // File lokal selalu dihapus (token, marker, proxy-type, agent-type)
-  [MARKER, ENV_FILE, ENV_FILE_KIMI, PROXY_TYPE_FILE, AGENT_TYPE_FILE].forEach(f => {
+  [MARKER, ENV_FILE, ENV_FILE_KIMI, ENV_FILE_DEEPSEEK, PROXY_TYPE_FILE, AGENT_TYPE_FILE].forEach(f => {
     if (fs.existsSync(f)) { fs.unlinkSync(f); info(`Dihapus: ${path.basename(f)}`); }
   });
 
@@ -1377,9 +1364,10 @@ if (arg === "--reset") {
 
 // Mode terpisah — langsung jalankan tanpa setup check
 if (arg === "proxy") {
-  // node start.js proxy          → PROXY env atau default qwen
-  // node start.js proxy qwen     → qwen proxy
-  // node start.js proxy kimi     → kimi proxy
+  // node start.js proxy              → PROXY env atau default qwen
+  // node start.js proxy qwen         → qwen proxy     (port 4891)
+  // node start.js proxy kimi         → kimi proxy     (port 4892)
+  // node start.js proxy deepseek     → deepseek proxy (port 4893)
   startProxy(arg2);
 } else if (arg === "gateway") {
   await startGateway();
@@ -1390,33 +1378,36 @@ if (arg === "proxy") {
   } else {
     ok(`Setup sudah ada (${fs.readFileSync(MARKER, "utf8").split("T")[0]})`);
 
-    // Cek apakah kimi tokens tersedia
     loadEnv();
-    const hasKimi = !!process.env.KIMI_TOKEN_1;
-    const hasQwen = !!process.env.QWEN_TOKEN_1;
+    const hasKimi     = !!process.env.KIMI_TOKEN_1;
+    const hasQwen     = !!process.env.QWEN_TOKEN_1;
+    const hasDeepSeek = !!process.env.DEEPSEEK_TOKEN_1;
 
-    // Cek proxy type tersimpan
     const savedProxy = fs.existsSync(PROXY_TYPE_FILE)
       ? fs.readFileSync(PROXY_TYPE_FILE, "utf8").trim()
       : null;
 
     console.log(`
 ${C.bold}Cara jalankan:${C.reset}
-  ${C.cyan}node start.js proxy${C.reset}         → proxy (${savedProxy ? `tersimpan: ${savedProxy}` : `default: ${process.env.PROXY || "qwen"}`})
-  ${C.cyan}node start.js proxy qwen${C.reset}    → Qwen proxy  (port 4891) + simpan pilihan
-  ${C.cyan}node start.js proxy kimi${C.reset}    → Kimi proxy  (port 4892) + simpan pilihan
-  ${C.cyan}node start.js gateway${C.reset}       → gateway (baca pilihan tersimpan${savedProxy ? `: ${savedProxy}` : ", default: qwen"})
-  ${C.cyan}node start.js gateway qwen${C.reset}  → gateway mode Qwen (override)
-  ${C.cyan}node start.js gateway kimi${C.reset}  → gateway mode Kimi (override)
-  ${C.cyan}node start.js${C.reset}               → proxy + gateway (mode lama)
+  ${C.cyan}node start.js proxy${C.reset}             → proxy (${savedProxy ? `tersimpan: ${savedProxy}` : `default: ${process.env.PROXY || "qwen"}`})
+  ${C.cyan}node start.js proxy qwen${C.reset}         → Qwen proxy     (port 4891) + simpan pilihan
+  ${C.cyan}node start.js proxy kimi${C.reset}         → Kimi proxy     (port 4892) + simpan pilihan
+  ${C.cyan}node start.js proxy deepseek${C.reset}     → DeepSeek proxy (port 4893) + simpan pilihan
+  ${C.cyan}node start.js gateway${C.reset}            → gateway (baca pilihan tersimpan${savedProxy ? `: ${savedProxy}` : ", default: qwen"})
+  ${C.cyan}node start.js gateway qwen${C.reset}       → gateway mode Qwen     (override)
+  ${C.cyan}node start.js gateway kimi${C.reset}       → gateway mode Kimi     (override)
+  ${C.cyan}node start.js gateway deepseek${C.reset}   → gateway mode DeepSeek (override)
+  ${C.cyan}node start.js${C.reset}                   → proxy + gateway (mode gabung)
 
-  ${C.gray}PROXY=kimi node start.js   → jalankan dengan Kimi proxy${C.reset}
-  ${C.gray}node start.js --reset      → setup ulang${C.reset}
+  ${C.gray}PROXY=kimi     node start.js  → jalankan dengan Kimi proxy
+  PROXY=deepseek node start.js  → jalankan dengan DeepSeek proxy
+  node start.js --reset         → setup ulang${C.reset}
 
 ${C.bold}Token tersedia:${C.reset}
-  Qwen: ${hasQwen ? `${C.green}✓${C.reset}` : `${C.red}✗ (isi QWEN_TOKEN_1 di .env.qwen)${C.reset}`}
-  Kimi: ${hasKimi ? `${C.green}✓${C.reset}` : `${C.yellow}belum — buat .env.kimi dengan KIMI_TOKEN_1=<cpmt_xxx atau eyJ...>${C.reset}`}
-${savedProxy ? `${C.bold}Proxy tersimpan:${C.reset} ${savedProxy === "kimi" ? C.cyan : C.green}${savedProxy}${C.reset}` : ""}
+  Qwen:     ${hasQwen     ? `${C.green}✓${C.reset}` : `${C.red}✗ (isi QWEN_TOKEN_1 di .env.qwen)${C.reset}`}
+  Kimi:     ${hasKimi     ? `${C.green}✓${C.reset}` : `${C.yellow}belum — buat .env.kimi dengan KIMI_TOKEN_1=<cpmt_xxx atau eyJ...>${C.reset}`}
+  DeepSeek: ${hasDeepSeek ? `${C.green}✓${C.reset}` : `${C.yellow}belum — buat .env.deepseek dengan DEEPSEEK_TOKEN_1=<eyJ...>${C.reset}`}
+${savedProxy ? `${C.bold}Proxy tersimpan:${C.reset} ${savedProxy === "kimi" ? C.cyan : savedProxy === "deepseek" ? C.cyan : C.green}${savedProxy}${C.reset}` : ""}
 `);
   }
   await runAll();
