@@ -56,6 +56,21 @@ how to get: open qwen chat → F12 → Application → Local Storage → click q
 
 ---
 
+## DEEPSEEK TOKEN (manual)
+
+create a `.env.deepseek` file:
+
+```
+DEEPSEEK_TOKEN_1=eyj..
+DEEPSEEK_TOKEN_2=eyj..
+DEEPSEEK_TOKEN_3=eyj..
+etc..
+```
+
+how to get: open deepseek chat → F12 → Application → Local Storage → click https://chat.deepseek → find `usertoken` → copy the value.
+
+---
+
 ## how to run
 
 ```bash
