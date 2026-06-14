@@ -28,7 +28,7 @@ import crypto from "crypto";
 import { URL } from "url";
 import fs     from "fs";
 
-// ── Auto-load .env file ───────────────────────────────────────────────────
+// ── Auto-load .env file
 // Coba .env.kimi dulu, fallback ke .env biasa.
 // Harus jalan SEBELUM POOL init supaya KIMI_TOKEN_* kebaca.
 (function loadDotEnv() {
@@ -89,7 +89,7 @@ function isDocMime(m) {
 const STREAM_IDLE_TIMEOUT_MS  = parseInt(process.env.KIMI_STREAM_IDLE_TIMEOUT  || "90000",  10); // 90s tanpa data → hang
 const STREAM_TOTAL_TIMEOUT_MS = parseInt(process.env.KIMI_STREAM_TOTAL_TIMEOUT || "300000", 10); // 5min hard cap
 
-// ── Image file-ID cache ──────────────────────────────────────────────────────
+// ── Image file-ID cache
 //
 // WHY: Agent frameworks like Hermes strip base64 images from conversation
 // history in later turns (to save context tokens). Without this cache, every
@@ -135,7 +135,7 @@ function _recentFileIds() {
   return [...new Set(_recentUploads.map(r => r.fileId))];
 }
 
-// ── Document file-ID cache ──────────────────────────────────────────────────
+// ── Document file-ID cache 
 // Sama seperti image cache tapi TTL lebih panjang (30 menit default)
 // karena PDF/dokumen butuh waktu lebih lama untuk diproses Kimi.
 const _docHashMap       = new Map();
@@ -160,7 +160,7 @@ function _recentDocFileIds() {
   return [...new Set(_recentDocUploads.map(r => r.fileId))];
 }
 
-// ── HTTPS agent ─────────────────────────────────────────────────────────────
+// ── HTTPS agent
 const AGENT = new https.Agent({
   keepAlive: true, keepAliveMsecs: 30_000,
   maxSockets: 20,  timeout: 120_000,
@@ -204,9 +204,7 @@ const MODEL_ALIAS = {
   "kimi-k2-thinking":"kimi-k2.6",
 };
 
-// ═══════════════════════════════════════════════════════════════════════════════
 // TOKEN SLOT — handles refresh lifecycle per token
-// ═══════════════════════════════════════════════════════════════════════════════
 
 function newDeviceId()  { return String(Math.floor(7e18 + Math.random() * 9e17)); }
 function newSessionId() { return String(Math.floor(1.7e18 + Math.random() * 9e16)); }
@@ -345,7 +343,7 @@ class TokenSlot {
   }
 }
 
-// ── Token pool ───────────────────────────────────────────────────────────────
+// ── Token pool 
 const POOL = [];
 for (let i = 1; i <= 10; i++) {
   const t = (process.env[`KIMI_TOKEN_${i}`] || "").trim();
@@ -375,7 +373,7 @@ function rotate(reason) {
   console.log(`[KimiProxy] rotate → slot ${alive()[rrIdx % alive().length]?.slot} | ${reason}`);
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Helpers
 function uuid() {
   return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, c => {
     const r = Math.random() * 16 | 0;
@@ -421,9 +419,7 @@ function mapModel(name) {
   return { modelId, thinking, scenario };
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
 // CONNECT PROTOCOL BINARY FRAMING
-// ═══════════════════════════════════════════════════════════════════════════════
 
 /**
  * Encode JSON payload → 5-byte header + body
@@ -470,9 +466,7 @@ function makeFrameParser(onEvent) {
   };
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
 // VISION — file upload + progress poll
-// ═══════════════════════════════════════════════════════════════════════════════
 
 /** Upload satu gambar ke Kimi → return { fileId, alreadyReady } */
 async function uploadImageToKimi(slot, buffer, filename, mimetype) {
@@ -656,9 +650,7 @@ function extractDocsFromMessages(messages) {
   return docs;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
 // TOOL CALLING (same inject-parse approach as Qwen proxy)
-// ═══════════════════════════════════════════════════════════════════════════════
 
 function toolsToSystemPrompt(tools, toolChoice = "auto") {
   if (!tools?.length || toolChoice === "none") return "";
@@ -756,7 +748,7 @@ function parseToolUse(content) {
   return calls.length ? calls : null;
 }
 
-// ── Build Kimi message blocks from OpenAI messages[] ────────────────────────
+// ── Build Kimi message blocks from OpenAI messages[]
 // Semua history disatukan jadi satu content string + optional file blocks.
 function extractText(content) {
   if (typeof content === "string") return content;
@@ -832,9 +824,7 @@ function buildKimiBlocks(messages, tools = [], toolChoice = "auto", allFileIds =
   return blocks;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
 // SSE HELPERS
-// ═══════════════════════════════════════════════════════════════════════════════
 
 function sseChunk(id, model, content, done = false) {
   return `data: ${JSON.stringify({
@@ -902,9 +892,7 @@ function safeFlushPoint(buf) {
   return safe;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
 // CORE STREAMER
-// ═══════════════════════════════════════════════════════════════════════════════
 
 /**
  * Stream Kimi chat → forward as OpenAI-compatible SSE
@@ -958,7 +946,7 @@ function streamKimi(slot, blocks, scenario, thinking, useSearch, res, id, modelI
       let reasoningSent = false;
       let resolved      = false;
 
-      // ── Stream timeouts ─────────────────────────────────────────────────────
+      // ── Stream timeouts
       // Kimi kadang biarkan koneksi TCP tetap hidup tanpa kirim data / event.done.
       // Tanpa timer ini proxy nunggu selamanya (jam-jaman).
       // - IDLE timeout  : reset setiap kali ada chunk data masuk
@@ -1076,7 +1064,7 @@ function streamKimi(slot, blocks, scenario, thinking, useSearch, res, id, modelI
           return;
         }
 
-        // ── Text block ─────────────────────────────────────────────────────
+        // ── Text block
         const tc = event.block?.text?.content;
         if (tc != null) {
           if (currentPhase === "thinking") {
@@ -1138,9 +1126,7 @@ function streamKimi(slot, blocks, scenario, thinking, useSearch, res, id, modelI
   });
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
 // OVERLOADED RETRY WRAPPER
-// ═══════════════════════════════════════════════════════════════════════════════
 
 /**
  * Wraps streamKimi with exponential-backoff retry on REASON_COMPLETION_OVERLOADED.
@@ -1191,9 +1177,7 @@ async function streamKimiWithRetry(firstSlot, blocks, scenario, thinking, useSea
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
 // HTTP SERVER
-// ═══════════════════════════════════════════════════════════════════════════════
 
 const server = http.createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -1201,7 +1185,7 @@ const server = http.createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-kimi-search");
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
-  // ── GET /v1/models ─────────────────────────────────────────────────────────
+  // ── GET /v1/models 
   if (req.method === "GET" && (
       req.url === "/v1" || req.url === "/v1/" || req.url === "/health" ||
       req.url?.startsWith("/v1/models"))) {
@@ -1218,14 +1202,14 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ── Not found ──────────────────────────────────────────────────────────────
+  // ── Not found
   if (req.method !== "POST" || req.url !== "/v1/chat/completions") {
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "Not found" }));
     return;
   }
 
-  // ── POST /v1/chat/completions ──────────────────────────────────────────────
+  // ── POST /v1/chat/completions 
   let body = "";
   req.on("data", c => body += c);
   req.on("end", async () => {
@@ -1308,7 +1292,7 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    // ── Inject recent image IDs (agent context continuity) ──────────────────
+    // ── Inject recent image IDs (agent context continuity) 
     {
       const fresh = _recentFileIds().filter(id => !imageFileIds.includes(id));
       if (fresh.length) {
@@ -1317,7 +1301,7 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    // ── Documents: upload PDF / DOCX / XLSX / dll ────────────────────────────
+    // ── Documents: upload PDF / DOCX / XLSX / dll
     // Endpoint sama persis dengan gambar (apiv2-files/file/upload), payload
     // multipart identik — bedanya hanya MIME type dan previewUrl selalu kosong
     // sehingga alreadyReady selalu false → selalu poll GetFileParseProgress.
@@ -1347,7 +1331,7 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    // ── Inject recent doc IDs (context continuity untuk multi-turn) ──────────
+    // ── Inject recent doc IDs (context continuity untuk multi-turn)
     {
       const freshDocs = _recentDocFileIds().filter(id => !docFileIds.includes(id));
       if (freshDocs.length) {
@@ -1359,7 +1343,7 @@ const server = http.createServer(async (req, res) => {
     // Gabung image + doc IDs → dikirim bareng ke Kimi sebagai file blocks
     const allFileIds = [...imageFileIds, ...docFileIds];
 
-    // ── Suppress file-analysis tools saat file ada di Kimi blocks ────────────
+    // ── Suppress file-analysis tools saat file ada di Kimi blocks
     // Tool seperti vision_analyze / document_analyze dieksekusi Hermes secara
     // lokal, bukan oleh Kimi. Kalau file sudah ada di blocks, suppress tools ini
     // supaya Kimi pakai kemampuan native-nya langsung.
@@ -1384,7 +1368,7 @@ const server = http.createServer(async (req, res) => {
     const id     = `chatcmpl-${uuid()}`;
     const isStreaming = parsed.stream === true;
 
-    // ── Streaming response ───────────────────────────────────────────────────
+    // ── Streaming response 
     if (isStreaming) {
       res.writeHead(200, {
         "Content-Type":      "text/event-stream",
@@ -1416,7 +1400,7 @@ const server = http.createServer(async (req, res) => {
         try { res.end(); } catch {}
       }
 
-    // ── Non-streaming response ───────────────────────────────────────────────
+    // ── Non-streaming response 
     } else {
       const chunks        = [];
       let toolCallsResult = null;
