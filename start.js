@@ -32,7 +32,7 @@ const AGENT_TYPE_FILE = path.join(__dirname, ".agent-type");
 // Folder untuk menyimpan backup file config sebelum di-patch (subfolder per-agent)
 const BACKUP_DIR = path.join(__dirname, "backup");
 
-// ─── HERMES CONFIG PATHS ──────────────────────────────────────────────────────
+//  HERMES CONFIG PATHS 
 // Priority: HERMES_HOME env (override resmi) > Windows LOCALAPPDATA > Linux/VPS ~/.hermes
 // Docs: native Windows → %LOCALAPPDATA%\hermes | Linux/macOS/VPS/WSL2 → ~/.hermes
 const HERMES_HOME = (() => {
@@ -45,7 +45,7 @@ const HERMES_HOME = (() => {
 const HERMES_ENV  = path.join(HERMES_HOME, ".env");
 const HERMES_CFG  = path.join(HERMES_HOME, "config.yaml");
 
-// ─── OPENCLAW CONFIG PATHS ────────────────────────────────────────────────────
+//  OPENCLAW CONFIG PATHS 
 // Priority: OPENCLAW_HOME env (override resmi) > ~/.openclaw (sama di Windows/Linux)
 // Windows native: C:\Users\<nama>\.openclaw | Linux/VPS/macOS: ~/.openclaw
 const CLAW_DIR = process.env.OPENCLAW_HOME
@@ -98,7 +98,7 @@ function resolveProxyType(argOverride) {
   return "qwen";
 }
 
-// ─── BACKUP HELPER ────────────────────────────────────────────────────────────
+// ─ BACKUP HELPER 
 // Set untuk mencegah double-backup file yang sama dalam satu sesi
 const backedUpThisRun = new Set();
 
@@ -294,11 +294,11 @@ function patchConfigClaw(tgToken, proxyType = "qwen") {
     : (process.env.QWEN_MODEL      || "qwen3.7-max");
   const provName  = isKimi ? "kimi-proxy" : isDeepSeek ? "deepseek-proxy" : "qwen-proxy";
 
-  // ── 1. gateway mode ──────────────────────────────────────────────────────
+  // ── 1. gateway mode 
   if (!config.gateway) config.gateway = {};
   config.gateway.mode = "local";
 
-  // ── 2. Telegram channel ──────────────────────────────────────────────────
+  // ── 2. Telegram channel 
   if (!config.channels) config.channels = {};
   config.channels.telegram = {
     enabled:   true,
@@ -306,7 +306,7 @@ function patchConfigClaw(tgToken, proxyType = "qwen") {
     dmPolicy:  "pairing",
   };
 
-  // ── 3. Model catalog (models.providers) ─────────────────────────────────
+  // ── 3. Model catalog (models.providers)
   // OpenClaw pakai models.providers.<id>.{baseUrl, apiKey, api, models[]}
   // ref: https://docs.openclaw.ai/gateway/config-tools#custom-providers-and-base-urls
   if (!config.models || Array.isArray(config.models)) config.models = {};
@@ -334,14 +334,14 @@ function patchConfigClaw(tgToken, proxyType = "qwen") {
     ],
   };
 
-  // ── 4. Default agent model ───────────────────────────────────────────────
+  // ── 4. Default agent model 
   if (!config.agents) config.agents = {};
   if (!config.agents.defaults) config.agents.defaults = {};
   config.agents.defaults.model = {
     primary:   `${provName}/${modelId}`,
   };
 
-  // ── 5. Web search tools ──────────────────────────────────────────────────
+  // ── 5. Web search tools 
   // Qwen proxy sekarang support auto_search native (auto-detect tool web_search),
   // jadi tools.profile "coding" (sudah include group:web) sudah cukup.
   // Tidak perlu external API key untuk kedua backend.
@@ -362,7 +362,7 @@ function patchConfig(tgToken, proxyType = "qwen") {
   else patchConfigClaw(tgToken, proxyType);
 }
 
-// ─── PYTHON DETECTOR ──────────────────────────────────────────────────────────
+// ─── PYTHON DETECTOR
 // Windows: "python" atau "py" | Unix: "python3" atau "python"
 function findPython() {
   const candidates = process.platform === "win32"
@@ -453,7 +453,7 @@ print("OK")
   }
 }
 
-// ─── HELPERS ─────────────────────────────────────────────────────────────────
+// ─ HELPERS 
 
 /** Tanya Y/N — default yes */
 function askYN(question, defaultYes = true) {
@@ -468,7 +468,7 @@ function askYN(question, defaultYes = true) {
   });
 }
 
-// ─── HERMES CONFIG PATCHER ────────────────────────────────────────────────────
+// ─── HERMES CONFIG PATCHER 
 /**
  * Patch ~/.hermes/config.yaml surgically untuk proxyType yang dipilih.
  * Yang diubah:
@@ -531,7 +531,7 @@ cfg["model"]["provider"] = "custom"
 cfg["model"]["api_key"]  = "proxy-key"
 cfg["model"]["api_mode"] = "chat_completions"
 
-# ── 2. custom_providers ─────────────────────────────────────────────────────
+# ── 2. custom_providers
 providers = cfg.get("custom_providers") or []
 # Hapus entry lama qwen/kimi/deepseek proxy
 providers = [p for p in providers if isinstance(p, dict)
@@ -563,7 +563,7 @@ else:
     })
 cfg["custom_providers"] = providers
 
-# ── 3. plugins + image_gen ──────────────────────────────────────────────────
+#  3. plugins + image_gen
 plugins = cfg.get("plugins") or {}
 if not isinstance(plugins, dict):
     plugins = {}
@@ -584,7 +584,7 @@ else:
 plugins["enabled"] = enabled
 cfg["plugins"] = plugins
 
-# ── 4. auxiliary.vision ─────────────────────────────────────────────────────
+# ── 4. auxiliary.vision
 if "auxiliary" not in cfg:
     cfg["auxiliary"] = {}
 if not isinstance(cfg["auxiliary"], dict):
@@ -632,7 +632,7 @@ print("OK")
   }
 }
 
-// ─── HERMES ENV PATCHER ───────────────────────────────────────────────────────
+// ─── HERMES ENV PATCHER
 /**
  * Patch OPENAI_BASE_URL di ~/.hermes/.env sesuai proxy yang dipilih.
  * Hanya baris OPENAI_BASE_URL yang diubah, semua baris lain tetap.
@@ -662,7 +662,7 @@ function patchHermesEnv(proxyType = "qwen") {
   ok(`Hermes .env → OPENAI_BASE_URL=${baseUrl}`);
 }
 
-// ─── WEB SEARCH BACKEND PATCHER ───────────────────────────────────────────────
+// ─ WEB SEARCH BACKEND PATCHER 
 /**
  * Patch web.search_backend & web.extract_backend di config.yaml.
  *  - Kimi  → "kimi"    (proxy sudah handle natively via $web_search tool)
@@ -748,7 +748,7 @@ print("OK")
   }
 }
 
-// ─── OPENCLAW CONFIG PATCHER ──────────────────────────────────────────────────
+// ─── OPENCLAW CONFIG PATCHER 
 /**
  * Patch openclaw.json untuk proxy type yang aktif (qwen/kimi).
  * Dipanggil setiap kali startGateway/runAll dengan AGENT=openclaw.
@@ -830,7 +830,7 @@ async function maybePatchConfig(proxyType = "qwen") {
     return;
   }
 
-  // ── Hermes path ────────────────────────────────────────────────────────────
+  // ── Hermes path
   if (AGENT !== "hermes") return;
 
   const isKimi     = proxyType === "kimi";
@@ -911,19 +911,19 @@ ${!isKimi ? `    TAVILY_API_KEY=tvly-xxxx...   ← ambil di https://app.tavily.c
     return;
   }
 
-  // ── Backup dulu sebelum patch ──────────────────────────────────────────────
+  // ── Backup dulu sebelum patch 
   backupFile(HERMES_CFG);
   backupFile(HERMES_ENV);
 
-  // ── Lakukan patch ──────────────────────────────────────────────────────────
+  // ── Lakukan patch 
   patchHermesConfig(proxyType);
   patchHermesEnv(proxyType);
   patchWebSearchBackend(proxyType);
 
-  // ── Tampilkan semua backup yang ada ────────────────────────────────────────
+  // ── Tampilkan semua backup yang ada
   showBackupSummary();
 
-  // ── Post-patch info ────────────────────────────────────────────────────────
+  // ── Post-patch info
   if (isKimi) {
     // Kimi: info bahwa web search sudah built-in via proxy
     ok("Kimi web search: sudah built-in via kimi-reverse-proxy.js");
@@ -1156,7 +1156,7 @@ ${C.reset}`);
   console.log(`\n${C.green}${C.bold}Setup selesai!${C.reset} (agent: ${AGENT})\n`);
 }
 
-// ─── RUN HELPERS ─────────────────────────────────────────────────────────────
+// ─── RUN HELPERS
 function ensureConfig(proxyType = "qwen") {
   const isKimi     = proxyType === "kimi";
   const isDeepSeek = proxyType === "deepseek";
@@ -1353,7 +1353,7 @@ async function runAll() {
   }, 1500);
 }
 
-// ─── MAIN ─────────────────────────────────────────────────────────────────────
+// ─── MAIN
 const arg  = process.argv[2];
 const arg2 = process.argv[3];   // sub-arg: "qwen" | "kimi"
 
