@@ -22,7 +22,7 @@ import crypto from "crypto";
 import { URL } from "url";
 import fs     from "fs";
 
-// ── Auto-load .env file ───────────────────────────────────────────────────
+// ── Auto-load .env file
 // Coba .env.qwen dulu (Qwen-specific), fallback ke .env biasa.
 // Jalankan SEBELUM semua konstanta supaya POOL bisa baca token.
 // Key yang sudah ada di process.env (set manual) tidak di-overwrite.
@@ -85,7 +85,7 @@ const AGENT = new https.Agent({
   timeout:        120_000,
 });
 
-// ── Model alias map ───────────────────────────────────────────────────────
+// ── Model alias map 
 const MODEL_MAP = {
   "qwen":                "qwen3-max",
   "qwen3":               "qwen3-max",
@@ -102,7 +102,7 @@ const MODEL_MAP = {
   "qwen3.5-max-preview": "qwen3.5-max-2026-03-08",
 };
 
-// ── Token pool ────────────────────────────────────────────────────────────
+// ── Token pool 
 const POOL = [];
 for (let i = 1; i <= 10; i++) {
   const t = (process.env[`QWEN_TOKEN_${i}`] || "").trim();
@@ -114,7 +114,7 @@ if (!POOL.length) {
 }
 console.log(`[QwenProxy] ${POOL.length} token dimuat | port=${PORT} | model=${DEFAULT_MODEL} | showThinking=${SHOW_THINKING} | defaultThinking=${DEFAULT_THINKING} | idleTimeout=${STREAM_IDLE_TIMEOUT_MS/1000}s | totalTimeout=${STREAM_TOTAL_TIMEOUT_MS/1000}s | retryMax=${RETRY_MAX}`);
 
-// ── Chat session pre-warm pool ────────────────────────────────────────────
+// ── Chat session pre-warm pool 
 const SESSION_POOL   = new Map();
 const SESSION_BUFFER = 2;
 
@@ -201,7 +201,7 @@ function mapModel(name) {
   return { modelId: MODEL_MAP[m] || m, thinkingSuffix };
 }
 
-// ── HTTP helpers ──────────────────────────────────────────────────────────
+// ── HTTP helpers 
 
 function makeHeaders(token, chatId) {
   return {
@@ -286,9 +286,7 @@ function delChat(token, chatId) {
   httpsDelete(`/api/v2/chats/${chatId}`, token).catch(() => {});
 }
 
-// ═════════════════════════════════════════════════════════════════════════
-// ── Vision: OSS Image Upload (image_recognize tool) ───────────────────────
-// ═════════════════════════════════════════════════════════════════════════
+// Vision: OSS Image Upload (image_recognize tool)
 //
 // Porting dari qwen.js: STS token → Alibaba OSS upload → kirim sebagai
 // image file di Qwen message payload. Dipakai saat client (Hermes auxiliary
@@ -415,10 +413,7 @@ function extractText(content) {
   return String(content || "");
 }
 
-// ═════════════════════════════════════════════════════════════════════════
-// ── Tool-calling support ──────────────────────────────────────────────────
-// ═════════════════════════════════════════════════════════════════════════
-
+// ── Tool-calling support 
 /**
  * Convert an OpenAI tools[] list into a Qwen system-prompt.
  * The model is instructed to emit [function_calls] blocks when calling tools.
@@ -627,7 +622,7 @@ function toPrompt(messages, tools = [], toolChoice = "auto") {
   return userContent;
 }
 
-// ── SSE helpers ───────────────────────────────────────────────────────────
+// ── SSE helpers 
 
 /**
  * Compute the safe flush boundary in buf, accounting for:
@@ -698,25 +693,23 @@ function stripUntrustedMarkers(text) {
     .replace(/Source:\s*Web Search\s*[-–—]+\s*/gi, "");
 }
 
-// ═════════════════════════════════════════════════════════════════════════
-// ── Core streamer ─────────────────────────────────────────────────────────
-// ═════════════════════════════════════════════════════════════════════════
+// ── Core streamer 
 
 /**
  * Stream a Qwen chat completion and forward it as OpenAI-compatible SSE.
  *
  * Phase handling mirror of the Python reference (stream_handler.py):
  *
- *  ┌────────────────────┬──────────────────────────────────────────────────┐
- *  │ Qwen phase         │ What we do                                        │
- *  ├────────────────────┼──────────────────────────────────────────────────┤
- *  │ think              │ reasoning_content delta  (if SHOW_THINKING)        │
- *  │ thinking_summary   │ reasoning_content delta  (if SHOW_THINKING)        │
- *  │                    │   reads delta.extra.summary_thought.content        │
- *  │ image_gen_tool     │ markdown ![image](url) text chunks                │
- *  │ answer / null      │ content delta; OR tool_calls when [function_calls] │
- *  │                    │   detected — text is streamed live until marker    │
- *  └────────────────────┴──────────────────────────────────────────────────┘
+ *  ┌────────────────────┬──────────────────────────────────────────────────
+ *  │ Qwen phase         │ What we do                                        
+ *  ├────────────────────┼──────────────────────────────────────────────────
+ *  │ think              │ reasoning_content delta  (if SHOW_THINKING)        
+ *  │ thinking_summary   │ reasoning_content delta  (if SHOW_THINKING)        
+ *  │                    │   reads delta.extra.summary_thought.content       
+ *  │ image_gen_tool     │ markdown ![image](url) text chunks                
+ *  │ answer / null      │ content delta; OR tool_calls when [function_calls] 
+ *  │                    │   detected — text is streamed live until marker    
+ *  └────────────────────┴──────────────────────────────────────────────────
  *
  * @param {string}  modelId    – already-resolved Qwen model ID
  * @param {string}  thinking   – "Auto" | "Thinking" | "Fast"
@@ -843,7 +836,7 @@ function streamQwen(token, chatId, prompt, modelId, thinking, useSearch, res, id
                 res.write(sseReasoningChunk(id, modelId, content));
               }
 
-            // ── Phase: thinking_summary ───────────────────────────────────
+            // ── Phase: thinking_summary
             // A condensed version of the reasoning. Stored in
             //   delta.extra.summary_thought.content  (array of strings)
             // Forwarded incrementally (only the diff vs previous send).
@@ -869,7 +862,7 @@ function streamQwen(token, chatId, prompt, modelId, thinking, useSearch, res, id
                 }
               }
 
-            // ── Phase: image_gen_tool ─────────────────────────────────────
+            // ── Phase: image_gen_tool 
             // Qwen built-in image generation. Image URLs live in:
             //   delta.extra.image_list              (primary — per qwen.js reference)
             //   delta.extra.tool_result.image_list  (fallback)
@@ -887,7 +880,7 @@ function streamQwen(token, chatId, prompt, modelId, thinking, useSearch, res, id
                 imageGenDone = true;
               }
 
-            // ── Phase: answer (or unphased) ───────────────────────────────────────────────
+            // ── Phase: answer (or unphased)
             // Normal text reply. Streamed live unless a tool-call marker
             // enters the buffer, at which point we stop text streaming and
             // let the end-handler emit tool_calls chunks instead.
@@ -1022,9 +1015,7 @@ function streamQwen(token, chatId, prompt, modelId, thinking, useSearch, res, id
   });
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ── Stream timeout retry wrapper ──────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
+//  Stream timeout retry wrapper
 
 /**
  * Wraps streamQwen dengan retry otomatis saat stream timeout (idle atau total).
@@ -1101,16 +1092,13 @@ function emitToolCalls(res, id, modelId, content) {
   })}\n\n`);
 }
 
-// ═════════════════════════════════════════════════════════════════════════
-// ── HTTP Server ───────────────────────────────────────────────────────────
-// ═════════════════════════════════════════════════════════════════════════
-
+//  HTTP Server 
 const server = http.createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-qwen-search");
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
-  // ── GET /v1/models (and health) ─────────────────────────────────────────
+  // ── GET /v1/models (and health) 
   if (req.method === "GET" && (req.url === "/v1" || req.url === "/v1/" ||
       req.url === "/health" || req.url?.startsWith("/v1/models"))) {
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -1123,7 +1111,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // ── POST /v1/images/generations ─────────────────────────────────────────
+  // ── POST /v1/images/generations 
   // OpenAI-compatible image gen — langsung parse delta.extra.image_list dari
   // Qwen stream, sesuai referensi qwen.js generateImage().
   // Override model: QWEN_IMAGE_MODEL env (default: "qwen3.7-plus").
@@ -1267,7 +1255,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // ── POST /v1/chat/completions ────────────────────────────────────────────
+  //  POST /v1/chat/completions
   let body = "";
   req.on("data", c => body += c);
   req.on("end", async () => {
@@ -1309,7 +1297,7 @@ const server = http.createServer((req, res) => {
       console.log(`[QwenProxy] Qwen native auto_search aktif (${reason})${hasNativeSearchTool ? " | web_search di-strip dari custom tools" : ""}`);
     }
 
-    // ── Resolve model + thinking mode ───────────────────────────────────
+    //  Resolve model + thinking mode 
     // Priority: model-name suffix > enable_thinking param > "Auto"
     const { modelId, thinkingSuffix } = mapModel(rawModel);
     const thinking = thinkingSuffix
@@ -1319,7 +1307,7 @@ const server = http.createServer((req, res) => {
 
     console.log(`[QwenProxy] ← model=${rawModel} → ${modelId} | msgs=${messages.length} tools=${activeToolList.length} thinking=${thinking} search=${useSearch} tool_choice=${JSON.stringify(toolChoice)}`);
 
-    // ── Vision: detect & upload images ──────────────────────────────────
+    // ── Vision: detect & upload images 
     // Scan messages untuk OpenAI multimodal content (type:"image_url").
     // Kalau ada → upload ke Qwen OSS dulu sebelum stream.
     // Hermes auxiliary vision kirim model=qwen3.7-plus secara otomatis;
@@ -1363,7 +1351,7 @@ const server = http.createServer((req, res) => {
     const id          = `chatcmpl-${uuid()}`;
     const isStreaming = parsed.stream === true;
 
-    // ── Streaming response ─────────────────────────────────────────────
+    //  Streaming response 
     if (isStreaming) {
       res.writeHead(200, {
         "Content-Type":      "text/event-stream",
@@ -1402,7 +1390,7 @@ const server = http.createServer((req, res) => {
         try { res.end(); } catch {}
       }
 
-    // ── Non-streaming response (collect all → return JSON) ─────────────
+    // ─ Non-streaming response (collect all → return JSON) 
     } else {
       const chunks        = [];
       let toolCallsResult = null;
