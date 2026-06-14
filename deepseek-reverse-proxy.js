@@ -9,7 +9,7 @@
  *  • Web search: native search_enabled flag (x-deepseek-search header)
  *  • Thinking mode: deepseek-reasoner / -thinking / -think suffix
  *  • Vision: upload gambar ke /api/v0/file/upload_file, poll sampai ready
- *  • POW Challenge solver via WASM (sha3_wasm_bg.7b9ca65ddd.wasm)
+ *  • POW Challenge solver via WASM (sha3.wasm)
  *  • Image + Doc file-ID cache (10/30 menit) — context continuity multi-turn
  *  • Retry otomatis (overloaded/timeout) — rotate slot, SSE keep-alive comment
  *
@@ -18,7 +18,15 @@
  *   DEEPSEEK_PROXY_PORT              – port (default: 4893)
  *   DEEPSEEK_MODEL                   – default model (default: deepseek-chat)
  *   DEEPSEEK_SHOW_THINKING           – emit reasoning_content delta (default: false)
- *   DEEPSEEK_WASM_PATH               – path ke .wasm (default: ./sha3_wasm_bg.7b9ca65ddd.wasm)
+ *   DEEPSEEK_WASM_PATH               – path ke .wasm (default: ./sha3.wasm)
+ *   DEEPSEEK_HIF_DLIQ                – nilai x-hif-dliq dari browser (fallback semua slot)
+ *   DEEPSEEK_HIF_LEIM                – nilai x-hif-leim dari browser (fallback semua slot)
+ *   DEEPSEEK_HIF_DLIQ_1..10          – per-slot override (prioritas di atas global)
+ *   DEEPSEEK_HIF_LEIM_1..10          – per-slot override (prioritas di atas global)
+ *   DEEPSEEK_SMIDV2                  – smidV2 cookie (fallback semua slot)
+ *   DEEPSEEK_SMIDV2_1..10            – per-slot override
+ *   DEEPSEEK_DS_SESSION_ID           – ds_session_id cookie (fallback semua slot)
+ *   DEEPSEEK_DS_SESSION_ID_1..10     – per-slot override
  *   DEEPSEEK_IMAGE_CACHE_TTL         – ms (default: 600000 = 10 menit)
  *   DEEPSEEK_DOC_CACHE_TTL           – ms (default: 1800000 = 30 menit)
  *   DEEPSEEK_STREAM_IDLE_TIMEOUT     – ms (default: 90000)
@@ -44,8 +52,12 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT          = parseInt(process.env.DEEPSEEK_PROXY_PORT  || "4893", 10);
 const DEFAULT_MODEL = process.env.DEEPSEEK_MODEL                || "deepseek-chat";
 const SHOW_THINKING = process.env.DEEPSEEK_SHOW_THINKING       === "true";
-const WASM_FILENAME = "sha3_wasm_bg.7b9ca65ddd.wasm";
+const WASM_FILENAME = "sha3.wasm";
 const WASM_PATH     = process.env.DEEPSEEK_WASM_PATH            || path.join(__dirname, WASM_FILENAME);
+const HIF_DLIQ      = process.env.DEEPSEEK_HIF_DLIQ             || "";
+const HIF_LEIM      = process.env.DEEPSEEK_HIF_LEIM             || "";
+const SMIDV2        = process.env.DEEPSEEK_SMIDV2               || "";
+const DS_SESSION_ID = process.env.DEEPSEEK_DS_SESSION_ID        || "";
 
 const STREAM_IDLE_TIMEOUT_MS  = parseInt(process.env.DEEPSEEK_STREAM_IDLE_TIMEOUT  || "90000",  10);
 const STREAM_TOTAL_TIMEOUT_MS = parseInt(process.env.DEEPSEEK_STREAM_TOTAL_TIMEOUT || "300000", 10);
@@ -76,12 +88,12 @@ const FAKE_HEADERS = {
   "Sec-Fetch-Dest":           "empty",
   "Sec-Fetch-Mode":           "cors",
   "Sec-Fetch-Site":           "same-origin",
-  "User-Agent":               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0",
-  "X-App-Version":            "20241129.1",
-  "X-Client-Locale":          "zh_CN",
+  "User-Agent":               "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+  "X-App-Version":            "2.0.0",
+  "X-Client-Locale":          "en_US",
   "X-Client-Platform":        "web",
-  "X-Client-Version":         "1.8.0",
-  "X-Client-Timezone-Offset": "28800",
+  "X-Client-Version":         "2.0.0",
+  "X-Client-Timezone-Offset": "0",
 };
 
 // ── Model mapping ─────────────────────────────────────────────────────────────
@@ -316,10 +328,26 @@ class TokenSlot {
     this.sessionAt    = 0;
     this._refreshing  = false;
     this._waiters     = [];
+    // HIF + Cookie headers per-slot — fallback ke global kalau slot-specific tidak diset
+    this.hifDliq     = (process.env[`DEEPSEEK_HIF_DLIQ_${slotNum}`]      || HIF_DLIQ).trim();
+    this.hifLeim     = (process.env[`DEEPSEEK_HIF_LEIM_${slotNum}`]      || HIF_LEIM).trim();
+    this.smidV2      = (process.env[`DEEPSEEK_SMIDV2_${slotNum}`]        || SMIDV2).trim();
+    this.dsSessionId = (process.env[`DEEPSEEK_DS_SESSION_ID_${slotNum}`] || DS_SESSION_ID).trim();
+    // Build cookie string dari komponen
+    this.cookie = [
+      this.smidV2      && `smidV2=${this.smidV2}`,
+      this.dsSessionId && `ds_session_id=${this.dsSessionId}`,
+    ].filter(Boolean).join("; ");
   }
 
   baseHeaders(extra = {}) {
-    return { ...FAKE_HEADERS, ...extra };
+    return {
+      ...FAKE_HEADERS,
+      ...(this.hifDliq && { "x-hif-dliq": this.hifDliq }),
+      ...(this.hifLeim && { "x-hif-leim": this.hifLeim }),
+      ...(this.cookie  && { "Cookie":      this.cookie  }),
+      ...extra,
+    };
   }
 
   async getAccessToken() {
@@ -505,6 +533,10 @@ if (!POOL.length) {
   process.exit(1);
 }
 console.log(`[DeepSeekProxy] ${POOL.length} token dimuat | port=${PORT} | model=${DEFAULT_MODEL} | showThinking=${SHOW_THINKING} | imgCache=${IMAGE_CACHE_TTL_MS/60000}m | docCache=${DOC_CACHE_TTL_MS/60000}m | retry=${OVERLOADED_RETRY_MAX}x${OVERLOADED_RETRY_DELAY}ms | sessionMode=delete-per-session`);
+const _hifSlots     = POOL.filter(s => s.hifDliq || s.hifLeim).length;
+const _cookieSlots  = POOL.filter(s => s.cookie).length;
+if (_hifSlots === 0) console.warn("[DeepSeekProxy] WARN: Tidak ada HIF headers — set DEEPSEEK_HIF_LEIM_1 untuk hindari bot detection");
+else console.log(`[DeepSeekProxy] HIF: ${_hifSlots}/${POOL.length} slot | Cookie: ${_cookieSlots}/${POOL.length} slot terkonfigurasi`);
 
 let rrIdx = 0;
 function alive() {
@@ -1313,9 +1345,8 @@ const server = http.createServer(async (req, res) => {
 
     const prompt = buildPrompt(messages, filteredTools, toolChoice);
 
-    let modelType = "default";
-    if (hasImages)     modelType = "vision";
-    else if (thinking) modelType = "expert";
+    // "expert" dihapus — thinking pakai model_type "default" + thinking_enabled:true
+    const modelType = hasImages ? "vision" : "default";
 
     const slot = nextSlot();
     let sessionId;
@@ -1340,6 +1371,7 @@ const server = http.createServer(async (req, res) => {
       ref_file_ids:      fileIds,
       thinking_enabled:  thinking,
       search_enabled:    useSearch,
+      action:            null,
       preempt:           false,
     };
 
