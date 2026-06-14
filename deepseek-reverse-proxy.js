@@ -45,9 +45,7 @@ import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// ══════════════════════════════════════════════════════════════════════════════
 // CONSTANTS
-// ══════════════════════════════════════════════════════════════════════════════
 
 const PORT          = parseInt(process.env.DEEPSEEK_PROXY_PORT  || "4893", 10);
 const DEFAULT_MODEL = process.env.DEEPSEEK_MODEL                || "deepseek-chat";
@@ -68,13 +66,13 @@ const OVERLOADED_RETRY_DELAY  = parseInt(process.env.DEEPSEEK_OVERLOADED_DELAY  
 
 const BASE = "https://chat.deepseek.com";
 
-// ── HTTPS agent ───────────────────────────────────────────────────────────────
+//  HTTPS agent 
 const AGENT = new https.Agent({
   keepAlive: true, keepAliveMsecs: 30_000,
   maxSockets: 20,  timeout: 120_000,
 });
 
-// ── Fake browser headers ──────────────────────────────────────────────────────
+// Fake browser headers 
 const FAKE_HEADERS = {
   "Accept":                   "*/*",
   "Accept-Encoding":          "gzip, deflate, br, zstd",
@@ -96,7 +94,7 @@ const FAKE_HEADERS = {
   "X-Client-Timezone-Offset": "0",
 };
 
-// ── Model mapping ─────────────────────────────────────────────────────────────
+// Model mapping
 const MODEL_ALIASES = {
   "deepseek-v4-flash": "deepseek-chat",
   "deepseek-v4-pro":   "deepseek-reasoner",
@@ -127,9 +125,7 @@ function mapModel(name) {
   return { modelId, thinking };
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
 // IMAGE CACHE (pola sama seperti kimi-reverse-proxy)
-// ══════════════════════════════════════════════════════════════════════════════
 
 const _imgHashMap    = new Map();
 const _recentUploads = [];
@@ -154,7 +150,7 @@ function _recentFileIds() {
   return [...new Set(_recentUploads.map(r => r.fileId))];
 }
 
-// ── Document MIME types ───────────────────────────────────────────────────────
+// Document MIME types 
 const DOC_MIME_TYPES = new Set([
   "application/pdf",
   "application/msword",
@@ -171,7 +167,7 @@ function isDocMime(m) {
   return DOC_MIME_TYPES.has((m || "").toLowerCase().split(";")[0].trim());
 }
 
-// ── Document cache (TTL lebih panjang: 30 menit default) ─────────────────────
+// Document cache (TTL lebih panjang: 30 menit default)
 const _docHashMap       = new Map();
 const _recentDocUploads = [];
 
@@ -192,9 +188,7 @@ function _recentDocFileIds() {
   return [...new Set(_recentDocUploads.map(r => r.fileId))];
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
 // HELPERS
-// ══════════════════════════════════════════════════════════════════════════════
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -223,7 +217,7 @@ function collectBody(res) {
   });
 }
 
-// ── Custom error classes (sama seperti kimi-reverse-proxy) ────────────────────
+//  Custom error classes (sama seperti kimi-reverse-proxy) 
 /** Dilempar kalau DeepSeek return 429 atau error overloaded di stream. */
 class OverloadedError extends Error {
   constructor(msg) { super(msg); this.name = "OverloadedError"; this.isOverloaded = true; }
@@ -234,9 +228,7 @@ class StreamTimeoutError extends Error {
   constructor(msg) { super(msg); this.name = "StreamTimeoutError"; this.isTimeout = true; }
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// WASM POW SOLVER — port dari coba.py (DeepSeekHashV1 via sha3_wasm_bg.wasm)
-// ══════════════════════════════════════════════════════════════════════════════
+// WASM POW SOLVER — port dari coba.py (DeepSeekHashV1 via sha3.wasm)
 
 let _wasmExports = null;
 
@@ -313,9 +305,7 @@ async function buildPowAnswer(challengeObj) {
   return Buffer.from(JSON.stringify(payload)).toString("base64");
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
 // TOKEN SLOT — access token lifecycle + session management
-// ══════════════════════════════════════════════════════════════════════════════
 
 class TokenSlot {
   constructor(raw, slotNum) {
@@ -556,9 +546,7 @@ function rotate(reason) {
   console.log(`[DeepSeekProxy] rotate → slot ${alive()[rrIdx % alive().length]?.slot} | ${reason}`);
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
 // TOOL CALLING — XML-based <tool_calling> (format native DeepSeek)
-// ══════════════════════════════════════════════════════════════════════════════
 
 function toolsToSystemPrompt(tools, toolChoice = "auto") {
   if (!tools?.length || toolChoice === "none") return "";
@@ -611,7 +599,7 @@ function parseToolUse(content) {
     const name = m[1].trim();
     let args   = m[2].trim();
 
-    // ── JSON validation — drop kalau malformed/truncated ─────────────────────
+    // ── JSON validation — drop kalau malformed/truncated 
     try {
       JSON.parse(args);
     } catch {
@@ -650,9 +638,7 @@ function safeFlushPoint(buf) {
   return buf.length;
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
 // MESSAGE FORMATTING — OpenAI messages[] → DeepSeek prompt string
-// ══════════════════════════════════════════════════════════════════════════════
 
 function extractText(content) {
   if (typeof content === "string") return content;
@@ -728,9 +714,7 @@ function buildPrompt(messages, tools = [], toolChoice = "auto") {
   return parts.join("").replace(/!\[.+?\]\(.+?\)/g, "");
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
 // VISION — extract, upload, poll
-// ══════════════════════════════════════════════════════════════════════════════
 
 function extractImagesFromMessages(messages) {
   const images = [];
@@ -880,9 +864,7 @@ async function waitForFile(slot, fileId, maxWait = 90_000) {
   return { ready: true, isImage: false };
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
 // SSE HELPERS
-// ══════════════════════════════════════════════════════════════════════════════
 
 function sseChunk(id, model, content, done = false) {
   return `data: ${JSON.stringify({
@@ -930,7 +912,6 @@ function emitToolCalls(res, id, model, answerBuf) {
   return true;
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
 // CORE STREAMER — DeepSeek SSE → OpenAI SSE
 //
 // DeepSeek SSE chunk formats:
@@ -938,7 +919,6 @@ function emitToolCalls(res, id, model, answerBuf) {
 //  2. {p: "response/fragments", v: [{type:..., content:...}], o:"APPEND"}
 //  3. {p: "response/search_results", v: [...]} — skip
 //  4. {v: "string"} — simple string delta
-// ══════════════════════════════════════════════════════════════════════════════
 
 function streamDeepSeek(slot, chatPayload, res, id, modelId, activeTools) {
   return new Promise(async (resolve, reject) => {
@@ -964,7 +944,7 @@ function streamDeepSeek(slot, chatPayload, res, id, modelId, activeTools) {
       }),
       agent: AGENT,
     }, dsRes => {
-      // ── HTTP-level error detection ──────────────────────────────────────────
+      // ── HTTP-level error detection
       if (dsRes.statusCode !== 200) {
         let b = "";
         dsRes.on("data", c => b += c);
@@ -1151,9 +1131,7 @@ function streamDeepSeek(slot, chatPayload, res, id, modelId, activeTools) {
   });
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
 // RETRY WRAPPER — sama pola seperti streamKimiWithRetry di kimi-reverse-proxy
-// ══════════════════════════════════════════════════════════════════════════════
 
 /**
  * Wrap streamDeepSeek dengan retry logic:
@@ -1225,7 +1203,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ── POST /v1/chat/completions ──────────────────────────────────────────────
+  // ── POST /v1/chat/completions
   let body = "";
   req.on("data", c => body += c);
   req.on("end", async () => {
@@ -1260,7 +1238,7 @@ const server = http.createServer(async (req, res) => {
     }
     console.log(`[DeepSeekProxy] ← model=${rawModel}→${modelId} | msgs=${messages.length} tools=${customTools.length} thinking=${thinking} search=${useSearch}`);
 
-    // ── Vision: upload images ────────────────────────────────────────────────
+    // ── Vision: upload images 
     let fileIds   = [];
     let hasImages = false;
     const rawImages = extractImagesFromMessages(messages);
@@ -1319,7 +1297,7 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    // ── Inject cached file IDs untuk context continuity ───────────────────────
+    // ── Inject cached file IDs untuk context continuity 
     const freshImgs = _recentFileIds().filter(id => !fileIds.includes(id));
     const freshDocs = _recentDocFileIds().filter(id => !fileIds.includes(id));
     if (freshImgs.length + freshDocs.length > 0) {
@@ -1328,7 +1306,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (fileIds.length > 0 && rawImages.length > 0) hasImages = true;
 
-    // ── Suppress file-analysis tools kalau ada file terlampir ─────────────────
+    // ── Suppress file-analysis tools kalau ada file terlampir
     // (DeepSeek punya vision bawaan, tools ini akan confuse model)
     const FILE_TOOL_NAMES = new Set([
       "vision_analyze", "image_analyze", "document_analyze", "file_analyze",
@@ -1378,7 +1356,7 @@ const server = http.createServer(async (req, res) => {
     const id       = `chatcmpl-${uuid()}`;
     const isStream = parsed.stream === true;
 
-    // ── Streaming ──────────────────────────────────────────────────────────
+    // ── Streaming
     if (isStream) {
       res.writeHead(200, {
         "Content-Type":      "text/event-stream",
@@ -1410,7 +1388,7 @@ const server = http.createServer(async (req, res) => {
         try { res.end(); } catch {}
       }
 
-    // ── Non-streaming ──────────────────────────────────────────────────────
+    // ── Non-streaming
     } else {
       const chunks = [];
       let toolCallsResult = null;
