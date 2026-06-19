@@ -9,7 +9,7 @@
  *  • Web search: native search_enabled flag (x-deepseek-search header)
  *  • Thinking mode: deepseek-reasoner / -thinking / -think suffix
  *  • Vision: upload gambar ke /api/v0/file/upload_file, poll sampai ready
- *  • POW Challenge solver via WASM (sha3.wasm)
+ *  • POW Challenge solver via WASM (sha3_wasm_bg.7b9ca65ddd.wasm)
  *  • Image + Doc file-ID cache (10/30 menit) — context continuity multi-turn
  *  • Retry otomatis (overloaded/timeout) — rotate slot, SSE keep-alive comment
  *
@@ -44,7 +44,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT          = parseInt(process.env.DEEPSEEK_PROXY_PORT  || "4893", 10);
 const DEFAULT_MODEL = process.env.DEEPSEEK_MODEL                || "deepseek-chat";
 const SHOW_THINKING = process.env.DEEPSEEK_SHOW_THINKING       === "true";
-const WASM_FILENAME = "sha3.wasm";
+const WASM_FILENAME = "sha3_wasm_bg.7b9ca65ddd.wasm";
 const WASM_PATH     = process.env.DEEPSEEK_WASM_PATH            || path.join(__dirname, WASM_FILENAME);
 
 const STREAM_IDLE_TIMEOUT_MS  = parseInt(process.env.DEEPSEEK_STREAM_IDLE_TIMEOUT  || "90000",  10);
@@ -53,8 +53,6 @@ const IMAGE_CACHE_TTL_MS      = parseInt(process.env.DEEPSEEK_IMAGE_CACHE_TTL   
 const DOC_CACHE_TTL_MS        = parseInt(process.env.DEEPSEEK_DOC_CACHE_TTL        || String(30 * 60 * 1000), 10);
 const OVERLOADED_RETRY_MAX    = parseInt(process.env.DEEPSEEK_OVERLOADED_RETRY     || "3",    10);
 const OVERLOADED_RETRY_DELAY  = parseInt(process.env.DEEPSEEK_OVERLOADED_DELAY     || "3000", 10);
-const MAX_MESSAGES            = parseInt(process.env.DEEPSEEK_MAX_MESSAGES         || "40",   10);
-const MAX_TOOL_TURNS          = parseInt(process.env.DEEPSEEK_MAX_TOOL_TURNS       || "20",   10);
 
 const BASE = "https://chat.deepseek.com";
 
@@ -380,10 +378,9 @@ class TokenSlot {
   }
 
   async getSession() {
-    if (this.sessionId && Date.now() - this.sessionAt < 300_000)
-      return this.sessionId;
-
-    // ── Hapus sesi lama dulu sebelum buat yang baru ──────────────────────────
+    // Selalu buat session baru per request — supaya tiap request punya
+    // chat session bersih di DeepSeek dan tidak akumulasi prompt history
+    // dari request-request sebelumnya dalam session yang sama.
     if (this.sessionId) {
       const oldId = this.sessionId;
       this.sessionId = null;
@@ -703,37 +700,6 @@ function safeFlushPoint(buf) {
 // ══════════════════════════════════════════════════════════════════════════════
 // MESSAGE FORMATTING — OpenAI messages[] → DeepSeek prompt string
 // ══════════════════════════════════════════════════════════════════════════════
-
-/**
- * Trim messages agar tidak melebihi batas context DeepSeek.
- * Strategi:
- *  1. Selalu pertahankan system message (index 0 kalau role=system)
- *  2. Pertahankan user message pertama (supaya context awal tidak hilang)
- *  3. Buang pesan lama dari tengah, sisakan MAX_MESSAGES pesan terbaru
- *  4. Pastikan tidak ada tool_call tanpa pasangan tool response (atau sebaliknya)
- */
-function trimMessages(messages) {
-  if (messages.length <= MAX_MESSAGES) return messages;
-
-  const system  = messages[0]?.role === "system" ? [messages[0]] : [];
-  const nonSys  = messages[0]?.role === "system" ? messages.slice(1) : messages;
-  const budget  = MAX_MESSAGES - system.length;
-
-  // Ambil pesan terbaru sebanyak budget
-  let trimmed = nonSys.slice(-budget);
-
-  // Pastikan tidak mulai dengan tool/assistant (harus mulai dari user)
-  while (trimmed.length && trimmed[0].role !== "user")
-    trimmed = trimmed.slice(1);
-
-  // Pastikan tidak ada tool response yatim (tool_call_id tanpa pasangan assistant di depannya)
-  const firstAssist = trimmed.findIndex(m => m.role === "assistant");
-  if (firstAssist > 0) trimmed = trimmed.slice(firstAssist > 0 ? firstAssist - 1 : 0);
-
-  const result = [...system, ...trimmed];
-  console.log(`[DeepSeekProxy] trimMessages: ${messages.length} → ${result.length} msgs (MAX_MESSAGES=${MAX_MESSAGES})`);
-  return result;
-}
 
 function extractText(content) {
   if (typeof content === "string") return content;
@@ -1424,8 +1390,7 @@ const server = http.createServer(async (req, res) => {
 
     const finalActiveTools = !!(filteredTools.length && toolChoice !== "none");
 
-    const trimmedMessages = trimMessages(messages);
-    const prompt = buildPrompt(trimmedMessages, filteredTools, toolChoice);
+    const prompt = buildPrompt(messages, filteredTools, toolChoice);
 
     let modelType = "default";
     if (hasImages)     modelType = "vision";
