@@ -9,7 +9,7 @@
  *  • Web search: native search_enabled flag (x-deepseek-search header)
  *  • Thinking mode: deepseek-reasoner / -thinking / -think suffix
  *  • Vision: upload gambar ke /api/v0/file/upload_file, poll sampai ready
- *  • POW Challenge solver via WASM (sha3.wasm)
+ *  • POW Challenge solver via WASM (sha3_wasm_bg.7b9ca65ddd.wasm)
  *  • Image + Doc file-ID cache (10/30 menit) — context continuity multi-turn
  *  • Retry otomatis (overloaded/timeout) — rotate slot, SSE keep-alive comment
  *
@@ -18,7 +18,7 @@
  *   DEEPSEEK_PROXY_PORT              – port (default: 4893)
  *   DEEPSEEK_MODEL                   – default model (default: deepseek-chat)
  *   DEEPSEEK_SHOW_THINKING           – emit reasoning_content delta (default: false)
- *   DEEPSEEK_WASM_PATH               – path ke .wasm (default: ./sha3.wasm)
+ *   DEEPSEEK_WASM_PATH               – path ke .wasm (default: ./sha3_wasm_bg.7b9ca65ddd.wasm)
  *   DEEPSEEK_IMAGE_CACHE_TTL         – ms (default: 600000 = 10 menit)
  *   DEEPSEEK_DOC_CACHE_TTL           – ms (default: 1800000 = 30 menit)
  *   DEEPSEEK_STREAM_IDLE_TIMEOUT     – ms (default: 90000)
@@ -44,7 +44,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT          = parseInt(process.env.DEEPSEEK_PROXY_PORT  || "4893", 10);
 const DEFAULT_MODEL = process.env.DEEPSEEK_MODEL                || "deepseek-chat";
 const SHOW_THINKING = process.env.DEEPSEEK_SHOW_THINKING       === "true";
-const WASM_FILENAME = "sha3.wasm";
+const WASM_FILENAME = "sha3_wasm_bg.7b9ca65ddd.wasm";
 const WASM_PATH     = process.env.DEEPSEEK_WASM_PATH            || path.join(__dirname, WASM_FILENAME);
 
 const STREAM_IDLE_TIMEOUT_MS  = parseInt(process.env.DEEPSEEK_STREAM_IDLE_TIMEOUT  || "90000",  10);
@@ -53,6 +53,8 @@ const IMAGE_CACHE_TTL_MS      = parseInt(process.env.DEEPSEEK_IMAGE_CACHE_TTL   
 const DOC_CACHE_TTL_MS        = parseInt(process.env.DEEPSEEK_DOC_CACHE_TTL        || String(30 * 60 * 1000), 10);
 const OVERLOADED_RETRY_MAX    = parseInt(process.env.DEEPSEEK_OVERLOADED_RETRY     || "3",    10);
 const OVERLOADED_RETRY_DELAY  = parseInt(process.env.DEEPSEEK_OVERLOADED_DELAY     || "3000", 10);
+const MAX_MESSAGES            = parseInt(process.env.DEEPSEEK_MAX_MESSAGES         || "40",   10);
+const MAX_TOOL_TURNS          = parseInt(process.env.DEEPSEEK_MAX_TOOL_TURNS       || "20",   10);
 
 const BASE = "https://chat.deepseek.com";
 
@@ -582,41 +584,110 @@ function hasToolUse(content) {
   return content.includes("<tool_calling");
 }
 
-function parseToolUse(content) {
+/** Repair + validate JSON args — return fixed string atau null kalau gagal total */
+function _repairArgs(raw, toolName) {
+  // Pass 1: as-is
+  try { JSON.parse(raw); return raw; } catch {}
+
+  // Pass 2: trailing commas, collapse newlines
+  const p2 = raw.replace(/,\s*([}\]])/g, "$1").replace(/\n+/g, " ").trim();
+  try { JSON.parse(p2); console.warn(`[DeepSeekProxy] parseToolUse: JSON repaired (p2) "${toolName}"`); return p2; } catch {}
+
+  // Pass 3: kutip kunci yang tidak terkutip  { key: "val" } → { "key": "val" }
+  const p3 = p2.replace(/([{,]\s*)([a-zA-Z_$][a-zA-Z0-9_$]*)(\s*:)/g, '$1"$2"$3');
+  try { JSON.parse(p3); console.warn(`[DeepSeekProxy] parseToolUse: JSON repaired (p3) "${toolName}"`); return p3; } catch {}
+
+  // Pass 4: potong di karakter JSON valid terakhir (handle truncated)
+  for (let i = raw.length - 1; i >= 0; i--) {
+    if ("}\"]0123456789truefalsnil".includes(raw[i])) {
+      const candidate = raw.slice(0, i + 1);
+      // Tutup semua bracket yang belum tertutup
+      const opens  = (candidate.match(/\{/g) || []).length - (candidate.match(/\}/g) || []).length;
+      const closes = "}".repeat(Math.max(0, opens));
+      try {
+        const fixed = candidate + closes;
+        JSON.parse(fixed);
+        console.warn(`[DeepSeekProxy] parseToolUse: JSON truncated+repaired (p4) "${toolName}"`);
+        return fixed;
+      } catch { continue; }
+    }
+  }
+
+  console.warn(`[DeepSeekProxy] parseToolUse: args invalid JSON "${toolName}" → drop | ${raw.slice(0,80)}`);
+  return null;
+}
+
+/** Ekstrak nama tool dari blok — toleran terhadap berbagai format malformed */
+function _extractName(block) {
+  // Normal:         <name>memory</name>
+  let m = block.match(/<name>([^<]+)<\/name>/);
+  if (m) return m[1].trim();
+
+  // Malformed attr:  <name="memory atau <name="memory">
+  m = block.match(/<name\s*=\s*["']?([a-zA-Z_][a-zA-Z0-9_]*)/);
+  if (m) return m[1].trim();
+
+  // Tag tidak tertutup: <name>memory (tanpa </name>)
+  m = block.match(/<name>([a-zA-Z_][a-zA-Z0-9_]*)/);
+  if (m) return m[1].trim();
+
+  // Baris pertama blok yang kelihatan seperti nama tool
+  m = block.trim().match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s*[\n{]/);
+  if (m) return m[1].trim();
+
+  return null;
+}
+
+/** Strict parser — regex yang sudah ada sebelumnya */
+function _parseStrict(content) {
   const calls = [];
   const re = /<tool_calling>\s*<name>([^<]+)<\/name>\s*<arguments>([\s\S]+?)<\/arguments>\s*<\/tool_calling>/g;
   let m;
   while ((m = re.exec(content)) !== null) {
-    const name = m[1].trim();
-    let args   = m[2].trim();
+    const name  = m[1].trim();
+    const fixed = _repairArgs(m[2].trim(), name);
+    if (!fixed) continue;
+    calls.push({ id: `tool_${calls.length}`, type: "function", function: { name, arguments: fixed } });
+  }
+  return calls;
+}
 
-    // ── JSON validation — drop kalau malformed/truncated ─────────────────────
-    try {
-      JSON.parse(args);
-    } catch {
-      // Coba repair sederhana: trailing comma, whitespace cleanup
-      const repaired = args
-        .replace(/,\s*([}\]])/g, "$1")   // trailing commas
-        .replace(/\n+/g, " ")            // newlines → spaces
-        .trim();
-      try {
-        JSON.parse(repaired);
-        args = repaired;
-        console.warn(`[DeepSeekProxy] parseToolUse: args JSON repaired untuk "${name}"`);
-      } catch {
-        // Tidak bisa direpair — drop
-        console.warn(`[DeepSeekProxy] parseToolUse: args invalid JSON untuk "${name}" → drop | ${args.slice(0,100)}`);
-        continue;
-      }
+/** Tolerant fallback — handle tag malformed, truncated, atau tanpa closing tag */
+function _parseFallback(content) {
+  const calls = [];
+
+  // Split per blok <tool_calling> — dengan atau tanpa closing tag
+  const blocks = content.split(/<tool_calling>/i).slice(1);
+  for (const raw of blocks) {
+    const block = raw.split(/<\/tool_calling>/i)[0]; // ambil sampai </tool_calling> atau akhir
+
+    const name = _extractName(block);
+    if (!name) { console.warn("[DeepSeekProxy] fallback parser: nama tidak ditemukan di blok, skip"); continue; }
+
+    // Cari argumen: antara <arguments> dan </arguments> atau akhir blok
+    let args = "{}";
+    const argsM = block.match(/<arguments>([\s\S]+?)(?:<\/arguments>|$)/i);
+    if (argsM) {
+      const fixed = _repairArgs(argsM[1].trim(), name);
+      if (fixed) args = fixed;
     }
 
-    calls.push({
-      id:   `tool_${calls.length}`,
-      type: "function",
-      function: { name, arguments: args },
-    });
+    calls.push({ id: `tool_${calls.length}`, type: "function", function: { name, arguments: args } });
+    console.warn(`[DeepSeekProxy] fallback parser: recovered tool "${name}"`);
   }
-  return calls.length ? calls : null;
+  return calls;
+}
+
+function parseToolUse(content) {
+  // Coba strict dulu
+  const strict = _parseStrict(content);
+  if (strict.length) return strict;
+
+  // Kalau tidak ada hasil tapi ada marker → coba fallback tolerant
+  if (!content.includes("<tool_calling")) return null;
+  console.warn("[DeepSeekProxy] parseToolUse: strict gagal → coba fallback tolerant");
+  const fallback = _parseFallback(content);
+  return fallback.length ? fallback : null;
 }
 
 const TOOL_MARKER = "<tool_calling";
@@ -632,6 +703,37 @@ function safeFlushPoint(buf) {
 // ══════════════════════════════════════════════════════════════════════════════
 // MESSAGE FORMATTING — OpenAI messages[] → DeepSeek prompt string
 // ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Trim messages agar tidak melebihi batas context DeepSeek.
+ * Strategi:
+ *  1. Selalu pertahankan system message (index 0 kalau role=system)
+ *  2. Pertahankan user message pertama (supaya context awal tidak hilang)
+ *  3. Buang pesan lama dari tengah, sisakan MAX_MESSAGES pesan terbaru
+ *  4. Pastikan tidak ada tool_call tanpa pasangan tool response (atau sebaliknya)
+ */
+function trimMessages(messages) {
+  if (messages.length <= MAX_MESSAGES) return messages;
+
+  const system  = messages[0]?.role === "system" ? [messages[0]] : [];
+  const nonSys  = messages[0]?.role === "system" ? messages.slice(1) : messages;
+  const budget  = MAX_MESSAGES - system.length;
+
+  // Ambil pesan terbaru sebanyak budget
+  let trimmed = nonSys.slice(-budget);
+
+  // Pastikan tidak mulai dengan tool/assistant (harus mulai dari user)
+  while (trimmed.length && trimmed[0].role !== "user")
+    trimmed = trimmed.slice(1);
+
+  // Pastikan tidak ada tool response yatim (tool_call_id tanpa pasangan assistant di depannya)
+  const firstAssist = trimmed.findIndex(m => m.role === "assistant");
+  if (firstAssist > 0) trimmed = trimmed.slice(firstAssist > 0 ? firstAssist - 1 : 0);
+
+  const result = [...system, ...trimmed];
+  console.log(`[DeepSeekProxy] trimMessages: ${messages.length} → ${result.length} msgs (MAX_MESSAGES=${MAX_MESSAGES})`);
+  return result;
+}
 
 function extractText(content) {
   if (typeof content === "string") return content;
@@ -1322,7 +1424,8 @@ const server = http.createServer(async (req, res) => {
 
     const finalActiveTools = !!(filteredTools.length && toolChoice !== "none");
 
-    const prompt = buildPrompt(messages, filteredTools, toolChoice);
+    const trimmedMessages = trimMessages(messages);
+    const prompt = buildPrompt(trimmedMessages, filteredTools, toolChoice);
 
     let modelType = "default";
     if (hasImages)     modelType = "vision";
