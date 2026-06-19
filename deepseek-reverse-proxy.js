@@ -9,7 +9,7 @@
  *  • Web search: native search_enabled flag (x-deepseek-search header)
  *  • Thinking mode: deepseek-reasoner / -thinking / -think suffix
  *  • Vision: upload gambar ke /api/v0/file/upload_file, poll sampai ready
- *  • POW Challenge solver via WASM (sha3.wasm)
+ *  • POW Challenge solver via WASM (sha3_wasm_bg.7b9ca65ddd.wasm)
  *  • Image + Doc file-ID cache (10/30 menit) — context continuity multi-turn
  *  • Retry otomatis (overloaded/timeout) — rotate slot, SSE keep-alive comment
  *
@@ -18,15 +18,7 @@
  *   DEEPSEEK_PROXY_PORT              – port (default: 4893)
  *   DEEPSEEK_MODEL                   – default model (default: deepseek-chat)
  *   DEEPSEEK_SHOW_THINKING           – emit reasoning_content delta (default: false)
- *   DEEPSEEK_WASM_PATH               – path ke .wasm (default: ./sha3.wasm)
- *   DEEPSEEK_HIF_DLIQ                – nilai x-hif-dliq dari browser (fallback semua slot)
- *   DEEPSEEK_HIF_LEIM                – nilai x-hif-leim dari browser (fallback semua slot)
- *   DEEPSEEK_HIF_DLIQ_1..10          – per-slot override (prioritas di atas global)
- *   DEEPSEEK_HIF_LEIM_1..10          – per-slot override (prioritas di atas global)
- *   DEEPSEEK_SMIDV2                  – smidV2 cookie (fallback semua slot)
- *   DEEPSEEK_SMIDV2_1..10            – per-slot override
- *   DEEPSEEK_DS_SESSION_ID           – ds_session_id cookie (fallback semua slot)
- *   DEEPSEEK_DS_SESSION_ID_1..10     – per-slot override
+ *   DEEPSEEK_WASM_PATH               – path ke .wasm (default: ./sha3_wasm_bg.7b9ca65ddd.wasm)
  *   DEEPSEEK_IMAGE_CACHE_TTL         – ms (default: 600000 = 10 menit)
  *   DEEPSEEK_DOC_CACHE_TTL           – ms (default: 1800000 = 30 menit)
  *   DEEPSEEK_STREAM_IDLE_TIMEOUT     – ms (default: 90000)
@@ -45,17 +37,15 @@ import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// ══════════════════════════════════════════════════════════════════════════════
 // CONSTANTS
+// ══════════════════════════════════════════════════════════════════════════════
 
 const PORT          = parseInt(process.env.DEEPSEEK_PROXY_PORT  || "4893", 10);
 const DEFAULT_MODEL = process.env.DEEPSEEK_MODEL                || "deepseek-chat";
 const SHOW_THINKING = process.env.DEEPSEEK_SHOW_THINKING       === "true";
-const WASM_FILENAME = "sha3.wasm";
+const WASM_FILENAME = "sha3_wasm_bg.7b9ca65ddd.wasm";
 const WASM_PATH     = process.env.DEEPSEEK_WASM_PATH            || path.join(__dirname, WASM_FILENAME);
-const HIF_DLIQ      = process.env.DEEPSEEK_HIF_DLIQ             || "";
-const HIF_LEIM      = process.env.DEEPSEEK_HIF_LEIM             || "";
-const SMIDV2        = process.env.DEEPSEEK_SMIDV2               || "";
-const DS_SESSION_ID = process.env.DEEPSEEK_DS_SESSION_ID        || "";
 
 const STREAM_IDLE_TIMEOUT_MS  = parseInt(process.env.DEEPSEEK_STREAM_IDLE_TIMEOUT  || "90000",  10);
 const STREAM_TOTAL_TIMEOUT_MS = parseInt(process.env.DEEPSEEK_STREAM_TOTAL_TIMEOUT || "300000", 10);
@@ -66,35 +56,30 @@ const OVERLOADED_RETRY_DELAY  = parseInt(process.env.DEEPSEEK_OVERLOADED_DELAY  
 
 const BASE = "https://chat.deepseek.com";
 
-//  HTTPS agent 
+// ── HTTPS agent ───────────────────────────────────────────────────────────────
 const AGENT = new https.Agent({
   keepAlive: true, keepAliveMsecs: 30_000,
   maxSockets: 20,  timeout: 120_000,
 });
 
-// Fake browser headers 
+// ── Fake browser headers ──────────────────────────────────────────────────────
 const FAKE_HEADERS = {
   "Accept":                   "*/*",
   "Accept-Encoding":          "gzip, deflate, br, zstd",
   "Accept-Language":          "zh-CN,zh;q=0.9,en-US;q=0.8",
   "Cache-Control":            "no-cache",
   "Origin":                   BASE,
+  "Pragma":                   "no-cache",
   "Referer":                  BASE + "/",
-  "Sec-Ch-Ua":                '"Microsoft Edge";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
-  "Sec-Ch-Ua-Mobile":         "?0",
-  "Sec-Ch-Ua-Platform":       '"Windows"',
-  "Sec-Fetch-Dest":           "empty",
-  "Sec-Fetch-Mode":           "cors",
-  "Sec-Fetch-Site":           "same-origin",
   "User-Agent":               "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
   "X-App-Version":            "2.0.0",
-  "X-Client-Locale":          "en_US",
+  "X-Client-Locale":          "zh_CN",
   "X-Client-Platform":        "web",
   "X-Client-Version":         "2.0.0",
-  "X-Client-Timezone-Offset": "0",
+  "X-Client-Timezone-Offset": "28800",
 };
 
-// Model mapping
+// ── Model mapping ─────────────────────────────────────────────────────────────
 const MODEL_ALIASES = {
   "deepseek-v4-flash": "deepseek-chat",
   "deepseek-v4-pro":   "deepseek-reasoner",
@@ -125,7 +110,9 @@ function mapModel(name) {
   return { modelId, thinking };
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
 // IMAGE CACHE (pola sama seperti kimi-reverse-proxy)
+// ══════════════════════════════════════════════════════════════════════════════
 
 const _imgHashMap    = new Map();
 const _recentUploads = [];
@@ -150,7 +137,7 @@ function _recentFileIds() {
   return [...new Set(_recentUploads.map(r => r.fileId))];
 }
 
-// Document MIME types 
+// ── Document MIME types ───────────────────────────────────────────────────────
 const DOC_MIME_TYPES = new Set([
   "application/pdf",
   "application/msword",
@@ -167,7 +154,7 @@ function isDocMime(m) {
   return DOC_MIME_TYPES.has((m || "").toLowerCase().split(";")[0].trim());
 }
 
-// Document cache (TTL lebih panjang: 30 menit default)
+// ── Document cache (TTL lebih panjang: 30 menit default) ─────────────────────
 const _docHashMap       = new Map();
 const _recentDocUploads = [];
 
@@ -188,7 +175,9 @@ function _recentDocFileIds() {
   return [...new Set(_recentDocUploads.map(r => r.fileId))];
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
 // HELPERS
+// ══════════════════════════════════════════════════════════════════════════════
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -217,7 +206,7 @@ function collectBody(res) {
   });
 }
 
-//  Custom error classes (sama seperti kimi-reverse-proxy) 
+// ── Custom error classes (sama seperti kimi-reverse-proxy) ────────────────────
 /** Dilempar kalau DeepSeek return 429 atau error overloaded di stream. */
 class OverloadedError extends Error {
   constructor(msg) { super(msg); this.name = "OverloadedError"; this.isOverloaded = true; }
@@ -228,7 +217,9 @@ class StreamTimeoutError extends Error {
   constructor(msg) { super(msg); this.name = "StreamTimeoutError"; this.isTimeout = true; }
 }
 
-// WASM POW SOLVER — port dari coba.py (DeepSeekHashV1 via sha3.wasm)
+// ══════════════════════════════════════════════════════════════════════════════
+// WASM POW SOLVER — port dari coba.py (DeepSeekHashV1 via sha3_wasm_bg.wasm)
+// ══════════════════════════════════════════════════════════════════════════════
 
 let _wasmExports = null;
 
@@ -305,10 +296,12 @@ async function buildPowAnswer(challengeObj) {
   return Buffer.from(JSON.stringify(payload)).toString("base64");
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
 // TOKEN SLOT — access token lifecycle + session management
+// ══════════════════════════════════════════════════════════════════════════════
 
 class TokenSlot {
-  constructor(raw, slotNum) {
+  constructor(raw, slotNum, cookie = "", hifDliq = "", hifLeim = "") {
     this.slot         = slotNum;
     this.dead         = false;
     this.refreshToken = raw;   // token asli dari user (Bearer dari browser)
@@ -318,26 +311,18 @@ class TokenSlot {
     this.sessionAt    = 0;
     this._refreshing  = false;
     this._waiters     = [];
-    // HIF + Cookie headers per-slot — fallback ke global kalau slot-specific tidak diset
-    this.hifDliq     = (process.env[`DEEPSEEK_HIF_DLIQ_${slotNum}`]      || HIF_DLIQ).trim();
-    this.hifLeim     = (process.env[`DEEPSEEK_HIF_LEIM_${slotNum}`]      || HIF_LEIM).trim();
-    this.smidV2      = (process.env[`DEEPSEEK_SMIDV2_${slotNum}`]        || SMIDV2).trim();
-    this.dsSessionId = (process.env[`DEEPSEEK_DS_SESSION_ID_${slotNum}`] || DS_SESSION_ID).trim();
-    // Build cookie string dari komponen
-    this.cookie = [
-      this.smidV2      && `smidV2=${this.smidV2}`,
-      this.dsSessionId && `ds_session_id=${this.dsSessionId}`,
-    ].filter(Boolean).join("; ");
+    // ── Anti-bot headers (wajib diisi dari browser session) ─────────────────
+    this.cookie   = cookie;    // ds_session_id=...; smidV2=...
+    this.hifDliq  = hifDliq;  // x-hif-dliq  (integrity token DeepSeek)
+    this.hifLeim  = hifLeim;  // x-hif-leim  (integrity token DeepSeek)
   }
 
   baseHeaders(extra = {}) {
-    return {
-      ...FAKE_HEADERS,
-      ...(this.hifDliq && { "x-hif-dliq": this.hifDliq }),
-      ...(this.hifLeim && { "x-hif-leim": this.hifLeim }),
-      ...(this.cookie  && { "Cookie":      this.cookie  }),
-      ...extra,
-    };
+    const antiBot = {};
+    if (this.cookie)  antiBot["Cookie"]      = this.cookie;
+    if (this.hifDliq) antiBot["x-hif-dliq"]  = this.hifDliq;
+    if (this.hifLeim) antiBot["x-hif-leim"]  = this.hifLeim;
+    return { ...FAKE_HEADERS, ...antiBot, ...extra };
   }
 
   async getAccessToken() {
@@ -515,18 +500,21 @@ class TokenSlot {
 // ── Token pool ────────────────────────────────────────────────────────────────
 const POOL = [];
 for (let i = 1; i <= 10; i++) {
-  const t = (process.env[`DEEPSEEK_TOKEN_${i}`] || "").trim();
-  if (t) POOL.push(new TokenSlot(t, i));
+  const t = (process.env[`DEEPSEEK_TOKEN_${i}`]   || "").trim();
+  if (!t) continue;
+  const cookie  = (process.env[`DEEPSEEK_COOKIE_${i}`]  || process.env["DEEPSEEK_COOKIE"]  || "").trim();
+  const hifDliq = (process.env[`DEEPSEEK_HIF_DLIQ_${i}`] || process.env["DEEPSEEK_HIF_DLIQ"] || "").trim();
+  const hifLeim = (process.env[`DEEPSEEK_HIF_LEIM_${i}`] || process.env["DEEPSEEK_HIF_LEIM"] || "").trim();
+  if (!cookie)  console.warn(`[DeepSeekProxy] PERINGATAN: DEEPSEEK_COOKIE_${i} kosong → slot ${i} rentan bot detection`);
+  if (!hifDliq) console.warn(`[DeepSeekProxy] PERINGATAN: DEEPSEEK_HIF_DLIQ_${i} kosong → slot ${i} rentan bot detection`);
+  if (!hifLeim) console.warn(`[DeepSeekProxy] PERINGATAN: DEEPSEEK_HIF_LEIM_${i} kosong → slot ${i} rentan bot detection`);
+  POOL.push(new TokenSlot(t, i, cookie, hifDliq, hifLeim));
 }
 if (!POOL.length) {
   console.error("[DeepSeekProxy] ERROR: Tidak ada token! Set DEEPSEEK_TOKEN_1 dulu.");
   process.exit(1);
 }
 console.log(`[DeepSeekProxy] ${POOL.length} token dimuat | port=${PORT} | model=${DEFAULT_MODEL} | showThinking=${SHOW_THINKING} | imgCache=${IMAGE_CACHE_TTL_MS/60000}m | docCache=${DOC_CACHE_TTL_MS/60000}m | retry=${OVERLOADED_RETRY_MAX}x${OVERLOADED_RETRY_DELAY}ms | sessionMode=delete-per-session`);
-const _hifSlots     = POOL.filter(s => s.hifDliq || s.hifLeim).length;
-const _cookieSlots  = POOL.filter(s => s.cookie).length;
-if (_hifSlots === 0) console.warn("[DeepSeekProxy] WARN: Tidak ada HIF headers — set DEEPSEEK_HIF_LEIM_1 untuk hindari bot detection");
-else console.log(`[DeepSeekProxy] HIF: ${_hifSlots}/${POOL.length} slot | Cookie: ${_cookieSlots}/${POOL.length} slot terkonfigurasi`);
 
 let rrIdx = 0;
 function alive() {
@@ -546,7 +534,9 @@ function rotate(reason) {
   console.log(`[DeepSeekProxy] rotate → slot ${alive()[rrIdx % alive().length]?.slot} | ${reason}`);
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
 // TOOL CALLING — XML-based <tool_calling> (format native DeepSeek)
+// ══════════════════════════════════════════════════════════════════════════════
 
 function toolsToSystemPrompt(tools, toolChoice = "auto") {
   if (!tools?.length || toolChoice === "none") return "";
@@ -599,7 +589,7 @@ function parseToolUse(content) {
     const name = m[1].trim();
     let args   = m[2].trim();
 
-    // ── JSON validation — drop kalau malformed/truncated 
+    // ── JSON validation — drop kalau malformed/truncated ─────────────────────
     try {
       JSON.parse(args);
     } catch {
@@ -638,7 +628,9 @@ function safeFlushPoint(buf) {
   return buf.length;
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
 // MESSAGE FORMATTING — OpenAI messages[] → DeepSeek prompt string
+// ══════════════════════════════════════════════════════════════════════════════
 
 function extractText(content) {
   if (typeof content === "string") return content;
@@ -714,7 +706,9 @@ function buildPrompt(messages, tools = [], toolChoice = "auto") {
   return parts.join("").replace(/!\[.+?\]\(.+?\)/g, "");
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
 // VISION — extract, upload, poll
+// ══════════════════════════════════════════════════════════════════════════════
 
 function extractImagesFromMessages(messages) {
   const images = [];
@@ -864,7 +858,9 @@ async function waitForFile(slot, fileId, maxWait = 90_000) {
   return { ready: true, isImage: false };
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
 // SSE HELPERS
+// ══════════════════════════════════════════════════════════════════════════════
 
 function sseChunk(id, model, content, done = false) {
   return `data: ${JSON.stringify({
@@ -912,6 +908,7 @@ function emitToolCalls(res, id, model, answerBuf) {
   return true;
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
 // CORE STREAMER — DeepSeek SSE → OpenAI SSE
 //
 // DeepSeek SSE chunk formats:
@@ -919,6 +916,7 @@ function emitToolCalls(res, id, model, answerBuf) {
 //  2. {p: "response/fragments", v: [{type:..., content:...}], o:"APPEND"}
 //  3. {p: "response/search_results", v: [...]} — skip
 //  4. {v: "string"} — simple string delta
+// ══════════════════════════════════════════════════════════════════════════════
 
 function streamDeepSeek(slot, chatPayload, res, id, modelId, activeTools) {
   return new Promise(async (resolve, reject) => {
@@ -944,7 +942,7 @@ function streamDeepSeek(slot, chatPayload, res, id, modelId, activeTools) {
       }),
       agent: AGENT,
     }, dsRes => {
-      // ── HTTP-level error detection
+      // ── HTTP-level error detection ──────────────────────────────────────────
       if (dsRes.statusCode !== 200) {
         let b = "";
         dsRes.on("data", c => b += c);
@@ -1131,7 +1129,9 @@ function streamDeepSeek(slot, chatPayload, res, id, modelId, activeTools) {
   });
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
 // RETRY WRAPPER — sama pola seperti streamKimiWithRetry di kimi-reverse-proxy
+// ══════════════════════════════════════════════════════════════════════════════
 
 /**
  * Wrap streamDeepSeek dengan retry logic:
@@ -1203,7 +1203,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ── POST /v1/chat/completions
+  // ── POST /v1/chat/completions ──────────────────────────────────────────────
   let body = "";
   req.on("data", c => body += c);
   req.on("end", async () => {
@@ -1238,7 +1238,7 @@ const server = http.createServer(async (req, res) => {
     }
     console.log(`[DeepSeekProxy] ← model=${rawModel}→${modelId} | msgs=${messages.length} tools=${customTools.length} thinking=${thinking} search=${useSearch}`);
 
-    // ── Vision: upload images 
+    // ── Vision: upload images ────────────────────────────────────────────────
     let fileIds   = [];
     let hasImages = false;
     const rawImages = extractImagesFromMessages(messages);
@@ -1297,7 +1297,7 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    // ── Inject cached file IDs untuk context continuity 
+    // ── Inject cached file IDs untuk context continuity ───────────────────────
     const freshImgs = _recentFileIds().filter(id => !fileIds.includes(id));
     const freshDocs = _recentDocFileIds().filter(id => !fileIds.includes(id));
     if (freshImgs.length + freshDocs.length > 0) {
@@ -1306,7 +1306,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (fileIds.length > 0 && rawImages.length > 0) hasImages = true;
 
-    // ── Suppress file-analysis tools kalau ada file terlampir
+    // ── Suppress file-analysis tools kalau ada file terlampir ─────────────────
     // (DeepSeek punya vision bawaan, tools ini akan confuse model)
     const FILE_TOOL_NAMES = new Set([
       "vision_analyze", "image_analyze", "document_analyze", "file_analyze",
@@ -1323,8 +1323,9 @@ const server = http.createServer(async (req, res) => {
 
     const prompt = buildPrompt(messages, filteredTools, toolChoice);
 
-    // "expert" dihapus — thinking pakai model_type "default" + thinking_enabled:true
-    const modelType = hasImages ? "vision" : "default";
+    let modelType = "default";
+    if (hasImages)     modelType = "vision";
+    else if (thinking) modelType = "expert";
 
     const slot = nextSlot();
     let sessionId;
@@ -1349,14 +1350,13 @@ const server = http.createServer(async (req, res) => {
       ref_file_ids:      fileIds,
       thinking_enabled:  thinking,
       search_enabled:    useSearch,
-      action:            null,
       preempt:           false,
     };
 
     const id       = `chatcmpl-${uuid()}`;
     const isStream = parsed.stream === true;
 
-    // ── Streaming
+    // ── Streaming ──────────────────────────────────────────────────────────
     if (isStream) {
       res.writeHead(200, {
         "Content-Type":      "text/event-stream",
@@ -1388,7 +1388,7 @@ const server = http.createServer(async (req, res) => {
         try { res.end(); } catch {}
       }
 
-    // ── Non-streaming
+    // ── Non-streaming ──────────────────────────────────────────────────────
     } else {
       const chunks = [];
       let toolCallsResult = null;
