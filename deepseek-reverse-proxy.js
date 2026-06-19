@@ -66,17 +66,18 @@ const AGENT = new https.Agent({
 const FAKE_HEADERS = {
   "Accept":                   "*/*",
   "Accept-Encoding":          "gzip, deflate, br, zstd",
-  "Accept-Language":          "zh-CN,zh;q=0.9,en-US;q=0.8",
+  "Accept-Language":          "en-US,en;q=0.9",
   "Cache-Control":            "no-cache",
   "Origin":                   BASE,
   "Pragma":                   "no-cache",
   "Referer":                  BASE + "/",
-  "User-Agent":               "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+  "User-Agent":               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
   "X-App-Version":            "2.0.0",
-  "X-Client-Locale":          "zh_CN",
+  "X-Client-Bundle-Id":       "com.deepseek.chat",
+  "X-Client-Locale":          "en_US",
   "X-Client-Platform":        "web",
   "X-Client-Version":         "2.0.0",
-  "X-Client-Timezone-Offset": "28800",
+  "X-Client-Timezone-Offset": "25200",
 };
 
 // ── Model mapping ─────────────────────────────────────────────────────────────
