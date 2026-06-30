@@ -1,6 +1,8 @@
 # sonnetrade - telegram = @Realsonnet
 agents using qwen / kimi / deepseek model,reverse api without paying for the official API. unlimited tokens
 
+QWEN ❌ KIMI ✅ DEEPSEEK ✅
+
 > 🇮🇩 [Baca dalam Bahasa Indonesia](Readme.md)
 
 ---
