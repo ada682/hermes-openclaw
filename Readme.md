@@ -119,3 +119,24 @@ built- in
 ```bash
 node start.js --reset
 ```
+
+
+All deepseek telemetry
+
+**Chat (7):**
+1. input_text_paste
+2. loadRemoteFeaturesSuccess
+3. hifRequestSuccess
+4. chatCompletionApi
+5. retrievePowAnswer
+6. powCleared
+7. send_button_click
+
+**Upload (7):**
+8. uploadFile
+9. file_upload
+10. file_upload_result
+11. uploadFileSuccess
+12. fetchFilesInfo
+13. file_parse_result
+14. parseFileSuccess
